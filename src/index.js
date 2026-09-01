@@ -1,0 +1,6591 @@
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env'), override: true });
+const { Telegraf, Markup } = require('telegraf');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const http = require('http');
+const https = require('https');
+const { exec } = require('child_process');
+const { loadLocale, t, getLang } = require('./i18n');
+const { config, isIDERunning, killIDE, cleanLockFile, launchIDE, getLastWorkspace, trustWorkspaceViaCDP, PLATFORM } = require('./platform');
+const { isAgentWorking, getFullLatestResponse, snapshotChatState, captureAgentScreenshot, captureFullIDEScreenshot, waitForAgentResponse, sendViaCDP, clickArtifactButton, triggerNewChat, triggerModelMenu, getAvailableModels, selectModel, getCurrentModel, stopAgent, getQuota, listWindows, setPreferredWindow, getPreferredWindow, getPreferredTargetId, getCachedWindows, closeWindow, closeAllEditors, listAgentThreads, switchAgentThread, getActiveThreadId, getActiveThreadInfo, setActiveWorkspace, switchStandaloneWorkspace, getLastResolvedThreadId, setLastResolvedThreadId, setOnThreadResolved } = require('./cdp_controller');
+const autoaccept = require('./autoaccept');
+const updater = require('./updater');
+const { runTurboOrchestration } = require('./turbo_orchestrator');
+const TaskWatcher = require('./task_watcher');
+const { extractLocalImageMarkdown } = require('./local_media');
+const { ensureCdpReady, isConnectionRefusedError } = require('./cdp_health');
+const accountManager = require('./account_manager');
+const { ensureMemoryConvention } = require('./memory_convention');
+const DriverFactory = require('./drivers');
+const telegraphPublisher = require('./telegraph_publisher');
+const {
+    shouldUseHeadless,
+    runAgyPrompt,
+    resetAgySession,
+    isAgySessionActive,
+    setAgyModel,
+    getAgyModel,
+    isAgyExecuting
+} = require('./headless_agent');
+
+let scheduleClient = null;
+try {
+    scheduleClient = require('./schedule_client');
+} catch (e) {
+    console.log('[CronCrew] schedule_client.js not found — schedule features disabled.');
+}
+
+const TURBO_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'turbo_state.json');
+const RESTART_FLAG_FILE = path.join(os.homedir(), '.gemini', 'antigravity', '.restart_pending');
+
+function escHtml(s) {
+    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function loadTurboState() {
+    try {
+        if (fs.existsSync(TURBO_STATE_FILE)) {
+            return JSON.parse(fs.readFileSync(TURBO_STATE_FILE, 'utf-8'));
+        }
+    } catch (e) {}
+    return { active: false, pinnedMsgId: null };
+}
+
+// Skills cache for interactive menu
+let cachedSkillsList = [];
+let cachedSkillCategories = {};
+
+function extractSkillDescription(content) {
+    if (!content) return '';
+    const match = content.match(/description:\s*([^\n\r]*)/i);
+    if (!match) return '';
+    let val = match[1].replace(/["']/g, '').trim();
+    if (val === '>' || val === '>-' || val === '|' || val === '|-' || val === '|+') {
+        const lines = content.split('\n');
+        const descLineIndex = lines.findIndex(l => /description:\s*[>|]/i.test(l));
+        if (descLineIndex !== -1) {
+            const collected = [];
+            for (let i = descLineIndex + 1; i < lines.length; i++) {
+                const line = lines[i];
+                if (line.startsWith('---')) break;
+                if (/^[a-zA-Z0-9_-]+:/.test(line)) break;
+                if (line.startsWith('  ') || line.startsWith('\t')) {
+                    const trimmed = line.trim();
+                    if (trimmed) collected.push(trimmed);
+                } else if (line.trim() === '') {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            val = collected.join(' ');
+        }
+    }
+    return val.replace(/[*_`#]/g, '').trim();
+}
+
+function saveTurboState() {
+    try {
+        fs.writeFileSync(TURBO_STATE_FILE, JSON.stringify({ active: isTurboMode, pinnedMsgId: turboPinnedMsgId }));
+    } catch (e) {}
+}
+
+const initialTurboState = loadTurboState();
+let isTurboMode = initialTurboState.active;
+let turboPinnedMsgId = initialTurboState.pinnedMsgId;
+
+let cachedAgentThreads = [];
+let cachedWorkspacesList = [];
+let cachedArtifacts = [];
+
+const MAP_FILE_PATH = path.join(os.homedir(), '.gemini', 'antigravity', 'message_target_map.json');
+function loadMessageTargetMap() {
+    try {
+        if (fs.existsSync(MAP_FILE_PATH)) {
+            return new Map(JSON.parse(fs.readFileSync(MAP_FILE_PATH, 'utf-8')));
+        }
+    } catch (err) { console.error('Failed to load messageTargetMap:', err.message); }
+    return new Map();
+}
+function saveMessageTargetMap(map) {
+    try {
+        if (map.size > 2000) {
+            const trimmed = Array.from(map.entries()).slice(-2000);
+            map.clear();
+            trimmed.forEach(([k, v]) => map.set(k, v));
+        }
+        fs.writeFileSync(MAP_FILE_PATH, JSON.stringify(Array.from(map.entries())));
+    } catch (err) { console.error('Failed to save messageTargetMap:', err.message); }
+}
+const messageTargetMap = loadMessageTargetMap();
+
+const LANG_STATE_FILE = path.join(os.homedir(), '.gemini', 'antigravity', 'lang.txt');
+
+function loadSavedLang() {
+    try {
+        if (fs.existsSync(LANG_STATE_FILE)) {
+            const saved = fs.readFileSync(LANG_STATE_FILE, 'utf-8').trim();
+            if (saved) return saved;
+        }
+    } catch (e) {}
+    return process.env.LANGUAGE || 'en';
+}
+
+function saveLangState(langCode) {
+    try {
+        fs.writeFileSync(LANG_STATE_FILE, langCode);
+    } catch (e) {}
+}
+
+// Load configured language
+const lang = loadSavedLang();
+loadLocale(lang);
+
+// ===== SECURITY: ALLOWED_CHAT_ID is mandatory =====
+const ALLOWED_CHAT_IDS = process.env.ALLOWED_CHAT_ID ? process.env.ALLOWED_CHAT_ID.split(',').map(id => id.trim()).filter(id => id) : [];
+if (ALLOWED_CHAT_IDS.length === 0) {
+    if (process.env.SETUP_MODE === 'true') {
+        console.warn('\n⚠️  SETUP MODE: Bot is running without ALLOWED_CHAT_ID.');
+        console.warn('Send /start to your bot to discover your chat ID.\n');
+    } else {
+        console.error('\n❌ SECURITY ERROR: ALLOWED_CHAT_ID is required.\n');
+        console.error('Set ALLOWED_CHAT_ID in your .env file to your Telegram chat ID. (You can use a comma-separated list of IDs)');
+        console.error('Send /start to your bot to discover your chat ID.');
+        console.error('Tip: Set SETUP_MODE=true in .env to run without ALLOWED_CHAT_ID during initial setup.\n');
+        process.exit(1);
+    }
+}
+
+const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 900000 }); // 15 minutes timeout to allow long /ask requests
+
+const pendingLogins = new Map();
+const lastSentMessageIdMap = new Map(); // conversationId -> { messageId, chatId, baseKeyboard }
+
+function checkAuth(ctx, next) {
+    const chatId = ctx.chat?.id;
+    const text = ctx.message?.text || '';
+    
+    if (text.startsWith('/')) {
+        accountManager.logInfo(`[auth] Incoming command "${text}" from chatId: ${chatId}`);
+    }
+
+    if (ALLOWED_CHAT_IDS.length === 0) {
+        accountManager.logInfo(`[auth] Rejecting: ALLOWED_CHAT_IDS is empty. Detected chatId: ${chatId}`);
+        console.log(`\n🔔 NEW CHAT ID DETECTED: ${ctx.chat.id}`);
+        console.log(`Please add ALLOWED_CHAT_ID=${ctx.chat.id} to your .env file and restart.\n`);
+        return ctx.reply(t('auth.setup_welcome', { chatId: ctx.chat.id })).catch(e => console.error('[checkAuth]', e.message));
+    }
+    if (!ALLOWED_CHAT_IDS.includes(ctx.chat.id.toString())) {
+        accountManager.logInfo(`[auth] Rejecting unauthorized chatId: ${chatId} (Allowed: ${ALLOWED_CHAT_IDS.join(', ')})`);
+        const from = ctx.from || ctx.chat;
+        if (from && ALLOWED_CHAT_IDS.length > 0) {
+            const username = from.username ? `@${from.username}` : 'N/A';
+            const fullName = `${from.first_name || ''} ${from.last_name || ''}`.trim() || t('auth.anonymous');
+            
+            let actionDetails = t('auth.action', { type: ctx.updateType || t('auth.unknown') });
+            if (ctx.message && ctx.message.text) actionDetails = t('auth.message', { text: ctx.message.text });
+            else if (ctx.callbackQuery) actionDetails = t('auth.button', { data: ctx.callbackQuery.data });
+
+            const alertMsg = t('auth.unauthorized_attempt', { name: fullName, username, id: from.id, details: actionDetails });
+            ctx.telegram.sendMessage(ALLOWED_CHAT_IDS[0], alertMsg, { parse_mode: 'HTML' }).catch(e => console.error('[checkAuth Alert]', e.message));
+        }
+        // Silently ignore unauthorized access to prevent errors if the user blocked the bot
+        return Promise.resolve();
+    }
+    
+    // Suspend other bot updates/callbacks if Google login is in progress
+    if (ctx.chat && pendingLogins.has(ctx.chat.id)) {
+        const isLoginCallback = ctx.callbackQuery?.data?.startsWith('login_');
+        const isTextMessage = ctx.message && ctx.message.text;
+        
+        if (!isLoginCallback && !isTextMessage) {
+            // Block other non-text interactions (like photo uploads, other inline buttons) during login
+            return ctx.reply(t('login.in_progress'), { parse_mode: 'HTML' });
+        }
+    }
+
+    if (text.startsWith('/')) {
+        accountManager.logInfo(`[auth] Authorized chatId: ${chatId} for command "${text}"`);
+    }
+    return next();
+}
+
+bot.use(checkAuth);
+
+// Fix for Issue #31: Prevent menu emojis and bare numbers from fanning out to all bots in a group
+bot.use((ctx, next) => {
+    const text = ctx.message?.text;
+    if (text && ctx.chat?.type !== 'private') {
+        const isMenuEmoji = /^(💬|📸|📦|⚡|🔴|🚀|🤖|🧠)/u.test(text);
+        const isBareNumber = /^\d+$/.test(text.trim());
+        
+        if (isMenuEmoji || isBareNumber) {
+            const hasMention = ctx.botInfo?.username && text.includes('@' + ctx.botInfo.username);
+            const isReplyToMe = ctx.message?.reply_to_message?.from?.id === ctx.botInfo?.id;
+            
+            if (!hasMention && !isReplyToMe) {
+                return; // Not addressed to this bot
+            }
+        }
+    }
+    return next();
+});
+
+// ── Passive code detection (mobile fallback) ───────────────────────────────────
+// If a user has a pending login and sends a message containing a Google auth
+// code or a full redirect URL, we intercept it and complete the login.
+bot.use(async (ctx, next) => {
+    if (!ctx.message || !ctx.message.text) {
+        return next();
+    }
+    const chatId = ctx.chat?.id;
+    if (!chatId || !pendingLogins.has(chatId)) {
+        return next();
+    }
+
+    const text = ctx.message.text.trim();
+    
+    // 1. Check if the user wants to cancel the login explicitly
+    if (text.toLowerCase() === '/cancel') {
+        const session = pendingLogins.get(chatId);
+        pendingLogins.delete(chatId);
+        try { await session.oauthServer.stop(); } catch { /* ignore */ }
+        if (session && typeof session.reject === 'function') {
+            session.reject(new Error('Login cancelled by user'));
+        }
+        await ctx.reply(t('login.cancelled'), { parse_mode: 'HTML' });
+        return; // Consume message
+    }
+
+    // Skip check if it is explicitly the /logincode command itself without arguments (let command handler run)
+    if (text.startsWith('/logincode') && text.split(' ').length === 1) {
+        return next();
+    }
+
+    // 2. Extract code from text or /logincode command arguments
+    let inputString = text;
+    if (text.startsWith('/logincode ')) {
+        inputString = text.substring(11).trim();
+    }
+
+    let code = null;
+    if (inputString.includes('code=') || inputString.startsWith('4/')) {
+        code = inputString;
+        const match = inputString.match(/[?&]code=([^&\s]+)/);
+        if (match) {
+            code = match[1];
+        }
+    }
+
+    const session = pendingLogins.get(chatId);
+
+    // 3. Process the extracted code or handle invalid try count
+    if (code) {
+        const completed = await completePendingLogin(chatId, code);
+        if (completed) {
+            await ctx.reply(t('login.code_received'), { parse_mode: 'HTML' });
+            return; // Consume message, do not pass to other handlers
+        }
+    } else {
+        // Increment tries for invalid link/code
+        session.tryCount = (session.tryCount || 0) + 1;
+        accountManager.logInfo(`[bot] Invalid login input pasted by chatId ${chatId}. Attempt ${session.tryCount}/3.`);
+
+        if (session.tryCount >= 3) {
+            pendingLogins.delete(chatId);
+            try { await session.oauthServer.stop(); } catch { /* ignore */ }
+            if (session && typeof session.reject === 'function') {
+                session.reject(new Error('Login cancelled: too many invalid attempts'));
+            }
+
+            await ctx.reply([
+                '🚫 <b>' + t('login.cancelled').split('\n')[0].replace(/<[^>]+>/g, '').trim() + '</b>',
+                '━'.repeat(22),
+                t('login.failed_attempts'),
+                '',
+                t('login.cancelled').split('\n').pop(),
+            ].join('\n'), { parse_mode: 'HTML' });
+        } else {
+            await ctx.reply(
+                t('login.invalid_code') + t('login.invalid_code_attempt', { count: session.tryCount }),
+                { parse_mode: 'HTML' }
+            );
+        }
+        return; // Consume message, do not pass to other handlers
+    }
+    return next();
+});
+
+let isTurboRunning = false;
+
+// Safe commands/buttons that can pass through during turbo execution
+const TURBO_SAFE_COMMANDS = [
+    '/turbo', '/stop', '/screenshot', '/latest', '/status',
+    '/quota', '/help', '/version', '/panel', '/menu',
+    '/file', '/cmd', '/autoaccept', '/lang', '/window',
+    '/artifacts', '/restart',
+    '/login', '/accounts', '/switchacc', '/getinfo', '/logincode', '/delacc'
+];
+const TURBO_SAFE_BUTTONS = [
+    '📸', '💬', '📦', '📊', '🚀'
+];
+
+// Middleware to prevent project switching or concurrent tasks while Turbo Mode is executing
+bot.use(async (ctx, next) => {
+    if (isTurboRunning) {
+        const text = ctx.message?.text || '';
+        const cbData = ctx.callbackQuery?.data || '';
+        
+        if (text) {
+            // Check exact match for /start to prevent bypassing with /start_ide and /start_ag
+            if (text.trim() === '/start') {
+                return next();
+            }
+            const isSafeCmd = TURBO_SAFE_COMMANDS.some(cmd => text.startsWith(cmd));
+            const isSafeBtn = TURBO_SAFE_BUTTONS.some(btn => text.startsWith(btn));
+            if (isSafeCmd || isSafeBtn) {
+                return next();
+            }
+            return ctx.reply('⏳ Turbo Mode is currently running! Are you sure you want to stop it?', Markup.inlineKeyboard([
+                [Markup.button.callback('🛑 Force Stop Turbo', 'turbo_force_stop')],
+                [Markup.button.callback('❌ Cancel', 'turbo_cancel')]
+            ]));
+        } else if (cbData) {
+            if (cbData.startsWith('file_') || cbData.startsWith('artifact_') || cbData.startsWith('turbo_')) {
+                return next();
+            }
+            return ctx.answerCbQuery(t('turbo.is_running_short') || '⏳ Please wait', { show_alert: true }).catch(()=>{});
+        } else if (ctx.message?.photo || ctx.message?.document) {
+            // Block file/photo uploads during turbo as they trigger sendViaCDP paste
+            return ctx.reply('⏳ Turbo Mode is currently running! Are you sure you want to stop it?', Markup.inlineKeyboard([
+                [Markup.button.callback('🛑 Force Stop Turbo', 'turbo_force_stop')],
+                [Markup.button.callback('❌ Cancel', 'turbo_cancel')]
+            ]));
+        }
+    }
+    return next();
+});
+function getCDPPort(app = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent') {
+    if (app === 'ide') {
+        return parseInt(process.env.IDE_CDP_PORT || '9334', 10);
+    }
+    try {
+        const devToolsFile = path.join(os.homedir(), 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort');
+        if (fs.existsSync(devToolsFile)) {
+            const lines = fs.readFileSync(devToolsFile, 'utf8').trim().split('\n');
+            const p = parseInt(lines[0], 10);
+            if (p && !isNaN(p)) return p;
+        }
+    } catch (_) {}
+    return parseInt(process.env.AGENT_CDP_PORT || process.env.DEBUGGING_PORT || '9333', 10);
+}
+let CDP_PORT = getCDPPort();
+
+async function sendViaCDPWithRecovery(text, specificTargetId = null) {
+    const app = config.preferredApp || 'agent';
+    await ensureCdpReady({ port: CDP_PORT, app });
+    try {
+        return await sendViaCDP(text, CDP_PORT, specificTargetId);
+    } catch (err) {
+        if (!isConnectionRefusedError(err)) {
+            throw err;
+        }
+        console.warn(`[cdp] Port ${CDP_PORT} refused connection; restarting ${app} with CDP and retrying once.`);
+        await ensureCdpReady({ port: CDP_PORT, app });
+        return sendViaCDP(text, CDP_PORT, null);
+    }
+}
+
+function updateEnvFile(key, value) {
+    const envPath = path.join(__dirname, '..', '.env');
+    let content = '';
+    try {
+        if (fs.existsSync(envPath)) {
+            content = fs.readFileSync(envPath, 'utf8');
+        } else {
+            const examplePath = path.join(__dirname, '..', '.env.example');
+            if (fs.existsSync(examplePath)) {
+                content = fs.readFileSync(examplePath, 'utf8');
+            }
+        }
+    } catch (e) {
+        console.error('Failed to read .env file:', e.message);
+    }
+
+    const lines = content.split(/\r?\n/);
+    let keyUpdated = false;
+    const newLines = lines.map(line => {
+        if (line.trim().startsWith(`${key}=`)) {
+            keyUpdated = true;
+            return `${key}=${value}`;
+        }
+        return line;
+    });
+
+    if (!keyUpdated) {
+        newLines.push(`${key}=${value}`);
+    }
+
+    try {
+        fs.writeFileSync(envPath, newLines.join('\n'), 'utf8');
+        process.env[key] = value;
+        return true;
+    } catch (e) {
+        console.error('Failed to write .env file:', e.message);
+        return false;
+    }
+}
+
+/**
+ * Auto-migrate missing env keys from .env.example to .env on startup.
+ * Ensures existing users get new required keys (like GOOGLE_CLIENT_ID)
+ * automatically after /update without manual .env editing.
+ */
+function migrateEnvFromExample() {
+    const envPath = path.join(__dirname, '..', '.env');
+    const examplePath = path.join(__dirname, '..', '.env.example');
+    
+    if (!fs.existsSync(envPath) || !fs.existsSync(examplePath)) return;
+    
+    try {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        const exampleContent = fs.readFileSync(examplePath, 'utf8');
+        
+        // Parse keys from both files
+        const envKeys = new Set();
+        envContent.split(/\r?\n/).forEach(line => {
+            const match = line.match(/^([A-Z_][A-Z0-9_]*)\s*=/);
+            if (match) envKeys.add(match[1]);
+        });
+        
+        // Find keys in .env.example that are missing from .env
+        const missing = [];
+        let currentComment = '';
+        exampleContent.split(/\r?\n/).forEach(line => {
+            if (line.startsWith('#')) {
+                currentComment = line;
+                return;
+            }
+            const match = line.match(/^([A-Z_][A-Z0-9_]*)\s*=(.*)/);
+            if (match && !envKeys.has(match[1])) {
+                // Skip keys that should be user-specific (BOT_TOKEN, ALLOWED_CHAT_ID)
+                const skipKeys = ['BOT_TOKEN', 'ALLOWED_CHAT_ID', 'SETUP_MODE'];
+                if (skipKeys.includes(match[1])) return;
+                
+                if (currentComment && missing.length === 0) {
+                    missing.push('');  // blank line separator
+                }
+                if (currentComment) {
+                    missing.push(currentComment);
+                    currentComment = '';
+                }
+                missing.push(line);
+            } else {
+                currentComment = '';
+            }
+        });
+        
+        if (missing.length > 0) {
+            const additions = '\n' + missing.join('\n') + '\n';
+            fs.appendFileSync(envPath, additions, 'utf8');
+            
+            // Also load them into process.env for current session
+            missing.forEach(line => {
+                const m = line.match(/^([A-Z_][A-Z0-9_]*)\s*=(.*)/);
+                if (m) process.env[m[1]] = m[2];
+            });
+            
+            console.log(`[env-migrate] Added ${missing.filter(l => l.match(/^[A-Z]/)).length} new key(s) from .env.example to .env`);
+        }
+    } catch (e) {
+        console.error('[env-migrate] Migration failed:', e.message);
+    }
+}
+
+// Run migration on startup
+migrateEnvFromExample();
+
+function markdownToTelegramHtml(text) {
+    if (!text) return '';
+    let html = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    
+    // Protect multiline code blocks using safe Unicode Private Use Area tokens
+    const codeBlocks = [];
+    html = html.replace(/```([a-z0-9_-]*)\n([\s\S]*?)```/gi, (match, lang, code) => {
+        const id = '\uE000CB' + codeBlocks.length + '\uE001';
+        if (lang) {
+            codeBlocks.push(`<pre><code class="language-${lang}">${code}</code></pre>`);
+        } else {
+            codeBlocks.push(`<pre>${code}</pre>`);
+        }
+        return id;
+    });
+
+    // Protect inline code
+    const inlineCodes = [];
+    html = html.replace(/`([^`\n]+)`/g, (match, code) => {
+        const id = '\uE000IC' + inlineCodes.length + '\uE001';
+        inlineCodes.push(`<code>${code}</code>`);
+        return id;
+    });
+
+    html = html.replace(/^(#{1,6})\s+(.+)$/gm, '<b>$2</b>');
+    html = html.replace(/\*\*([^\*]+)\*\*/g, '<b>$1</b>');
+    html = html.replace(/(?<![A-Za-z0-9])\*([^\*]+)\*(?![A-Za-z0-9])/g, '<i>$1</i>');
+    html = html.replace(/(?<![A-Za-z0-9])_([^_]+)_(?![A-Za-z0-9])/g, '<i>$1</i>');
+    html = html.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/gi, '<b>$1</b>');
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+    html = html.replace(/\[x\]/ig, '✅');
+    html = html.replace(/\[ \]/g, '⬜');
+    html = html.replace(/\[\/\]/g, '🔄');
+
+    // Restore protected code
+    inlineCodes.forEach((code, idx) => {
+        html = html.replace('\uE000IC' + idx + '\uE001', () => code);
+    });
+    codeBlocks.forEach((code, idx) => {
+        html = html.replace('\uE000CB' + idx + '\uE001', () => code);
+    });
+
+    return html;
+}
+
+function downloadLocalImageUrl(rawUrl) {
+    return new Promise((resolve, reject) => {
+        let parsed;
+        try {
+            parsed = new URL(rawUrl);
+        } catch (err) {
+            reject(err);
+            return;
+        }
+
+        const client = parsed.protocol === 'https:' ? https : http;
+        const onResponse = (res) => {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                res.resume();
+                reject(new Error(`HTTP ${res.statusCode}`));
+                return;
+            }
+
+            const chunks = [];
+            res.on('data', chunk => chunks.push(chunk));
+            res.on('end', () => {
+                const filename = path.basename(parsed.pathname) || 'image';
+                resolve({ buffer: Buffer.concat(chunks), filename });
+            });
+        };
+        const req = parsed.protocol === 'https:'
+            ? client.get(parsed, { rejectUnauthorized: false }, onResponse)
+            : client.get(parsed, onResponse);
+
+        req.setTimeout(15000, () => req.destroy(new Error('download timeout')));
+        req.on('error', reject);
+    });
+}
+
+async function sendExtractedImage(ctx, image, replyToMsgId = null) {
+    const replyOptions = replyToMsgId
+        ? { reply_parameters: { message_id: replyToMsgId, allow_sending_without_reply: true } }
+        : undefined;
+
+    if (image.type === 'url') {
+        const downloaded = await downloadLocalImageUrl(image.path);
+        await ctx.replyWithPhoto(
+            { source: downloaded.buffer, filename: downloaded.filename },
+            replyOptions
+        );
+        return;
+    }
+
+    if (!fs.existsSync(image.path)) {
+        console.warn(`[local_media] Image not found: ${image.path}`);
+        return;
+    }
+
+    await ctx.replyWithPhoto(
+        { source: image.path },
+        replyOptions
+    );
+}
+
+// Helper: Send long messages safely within Telegram's 4096 char limit
+async function sendLongMessage(ctx, text, prefix = '', buttons = null, replyToMsgId = null) {
+    const MAX_LEN = 3500;
+    
+    // Extract file links: e.g. [task.md](file:///C:/Users/...)
+    const fileLinkRegex = /\[([^\]]+)\]\((file:\/\/\/[^\)]+)\)/gi;
+    let fileMatch;
+    const fileButtons = [];
+    
+    fileLinkRegex.lastIndex = 0;
+    while ((fileMatch = fileLinkRegex.exec(text)) !== null) {
+        const label = fileMatch[1];
+        const rawUrl = fileMatch[2];
+        try {
+            const rawPath = rawUrl.replace(/^file:\/\/\//i, '');
+            const decodedPath = decodeURIComponent(rawPath);
+            const normalizedPath = path.normalize(decodedPath);
+            const pathId = getPathId(normalizedPath);
+            
+            const mapping = telegraphPublisher.getPageMapping(normalizedPath);
+            if (mapping && mapping.url) {
+                fileButtons.push([{ text: `🌐 Open ${label}`, url: mapping.url }]);
+            }
+        } catch (e) {
+            console.error('[sendLongMessage] Failed to process file link:', e.stack);
+        }
+    }
+
+    const conversationId = getLastResolvedThreadId();
+    const artifactButtons = getArtifactButtons(conversationId);
+    
+    let finalButtons = buttons;
+    let inlineKeyboard = [];
+    
+    if (fileButtons.length > 0) {
+        inlineKeyboard.push(...fileButtons);
+    }
+    if (artifactButtons.length > 0) {
+        inlineKeyboard.push(...artifactButtons);
+    }
+    if (buttons) {
+        if (Array.isArray(buttons)) {
+            inlineKeyboard.push(...buttons);
+        } else if (buttons.reply_markup && Array.isArray(buttons.reply_markup.inline_keyboard)) {
+            inlineKeyboard.push(...buttons.reply_markup.inline_keyboard);
+        }
+    }
+    
+    if (inlineKeyboard.length > 0) {
+        finalButtons = { reply_markup: { inline_keyboard: inlineKeyboard } };
+    }
+
+    const localMedia = extractLocalImageMarkdown(text);
+    text = localMedia.text;
+
+    for (const image of localMedia.images) {
+        try {
+            await sendExtractedImage(ctx, image, replyToMsgId);
+        } catch (err) {
+            console.warn(`[local_media] Failed to send image ${image.path}: ${err.message}`);
+        }
+    }
+    
+    // Parse text to HTML and preserve prefix formatting
+    const htmlText = prefix ? `<b>${prefix}</b>\n\n${markdownToTelegramHtml(text)}` : markdownToTelegramHtml(text);
+    
+    async function replyWithRetry(content, isPlain = false, kbOpts = null, retries = 3, threadReplyId = null) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                const opts = {};
+                if (!isPlain) opts.parse_mode = 'HTML';
+                
+                if (kbOpts) {
+                    if (Array.isArray(kbOpts)) {
+                        if (kbOpts.length > 0) opts.reply_markup = { inline_keyboard: kbOpts };
+                    } else if (kbOpts.reply_markup) {
+                        opts.reply_markup = kbOpts.reply_markup;
+                    }
+                }
+                if (threadReplyId) {
+                    opts.reply_parameters = { message_id: threadReplyId, allow_sending_without_reply: true };
+                }
+                return await ctx.reply(content, opts);
+            } catch (err) {
+                console.error(`sendLongMessage attempt ${attempt}/${retries} failed:`, err.message);
+                if (attempt < retries && !err.message.includes("can't parse entities")) {
+                    await new Promise(r => setTimeout(r, 2000 * attempt));
+                } else if (err.message.includes("can't parse entities") && !isPlain) {
+                    // Fallback to sending raw text if HTML parsing completely fails
+                    const plain = content.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+                    return await replyWithRetry(plain.substring(0, 4000), true, kbOpts, 1, threadReplyId);
+                } else {
+                    throw err;
+                }
+            }
+        }
+    }
+
+    try {
+        const lines = htmlText.split('\n');
+        let currentChunk = '';
+        let inPre = false;
+        let preLang = '';
+        let currentReplyId = replyToMsgId;
+        const sentMsgIds = [];
+
+        for (let i = 0; i < lines.length; i++) {
+            let line = lines[i];
+            
+            // If a single line is absurdly long, force a split
+            if (line.length > MAX_LEN) {
+               line = line.substring(0, MAX_LEN) + '...';
+            }
+
+            const preMatch = line.match(/<pre>(?:<code class="language-([^"]+)">)?/);
+            if (preMatch) {
+                inPre = true;
+                preLang = preMatch[1] || '';
+            }
+            if (line.includes('</pre>')) {
+                inPre = false;
+            }
+            
+            if (currentChunk.length + line.length > MAX_LEN) {
+                if (inPre) {
+                    currentChunk += preLang ? '</code></pre>' : '</pre>';
+                }
+                const sentMsg = await replyWithRetry(currentChunk, false, null, 3, currentReplyId);
+                if (sentMsg) {
+                    currentReplyId = sentMsg.message_id;
+                    sentMsgIds.push(sentMsg.message_id);
+                }
+                currentChunk = inPre ? (preLang ? `<pre><code class="language-${preLang}">\n` : '<pre>\n') : '';
+            }
+            currentChunk += line + '\n';
+        }
+        if (currentChunk.trim().length > 0) {
+            const sentMsg = await replyWithRetry(currentChunk, false, finalButtons, 3, currentReplyId);
+            if (sentMsg) sentMsgIds.push(sentMsg.message_id);
+        }
+        if (sentMsgIds && sentMsgIds.length > 0) {
+            const lastMsgId = sentMsgIds[sentMsgIds.length - 1];
+            lastSentMessageIdMap.set(ctx.chat.id, {
+                messageId: lastMsgId,
+                chatId: ctx.chat.id,
+                baseKeyboard: buttons
+            });
+        }
+        console.log(`sendLongMessage: Sent successfully`);
+        return sentMsgIds;
+    } catch (err) {
+        console.error('sendLongMessage final error:', err.message);
+        return [];
+    }
+}
+
+// Alias used by account/telegraph features (PR #21)
+const sendBotMessage = sendLongMessage;
+
+// Strip agent query echo from response text only if it appears at the beginning
+function stripQueryFromResponse(text, query) {
+    if (!text || !query) return text || '';
+    const queryTrimmed = query.trim();
+    if (!queryTrimmed) return text;
+    if (text.startsWith(queryTrimmed)) {
+        text = text.substring(queryTrimmed.length).trim();
+    } else if (text.startsWith(`"${queryTrimmed}"`)) {
+        text = text.substring(queryTrimmed.length + 2).trim();
+    }
+    return text;
+}
+
+/**
+ * Set an emoji reaction on a message instead of sending a separate info message.
+ * Falls back silently if reaction fails (e.g., old Telegram client or unsupported chat type).
+ * 
+ * Valid Telegram reaction emojis (not all Unicode emojis are allowed):
+ * 👍 👎 ❤ 🔥 🎉 🤔 👀 ⚡ 👌 💯 🏆 😁 (and more, but NOT ✅ ❌)
+ */
+const REACTION = { THINKING: '🤔', SUCCESS: '👍', ERROR: '👎', LOOKING: '👀', FIRE: '🔥' };
+
+async function setReaction(ctx, emoji, messageId = null) {
+    try {
+        const chatId = ctx.chat.id;
+        const msgId = messageId || ctx.message?.message_id;
+        if (!msgId) return;
+        
+        const reaction = emoji ? JSON.stringify([{ type: 'emoji', emoji }]) : '[]';
+        await ctx.telegram.callApi('setMessageReaction', {
+            chat_id: chatId,
+            message_id: msgId,
+            reaction
+        });
+    } catch (e) {
+        // Silently fail — reactions may not be supported in all chat types
+        console.debug(`[setReaction] Failed: ${e.message}`);
+    }
+}
+
+// Typing-aware progress callback factory
+function createProgressHandler(ctx) {
+    return (msg) => {
+        if (msg === 'typing') {
+            ctx.sendChatAction('typing').catch(() => {});
+        } else {
+            ctx.reply(msg).catch(() => {});
+        }
+    };
+}
+
+// ===== COMMANDS =====
+
+bot.start((ctx) => {
+    ctx.reply(t('bot.started', { chatId: ctx.chat.id }));
+});
+
+async function cleanupAll() {
+    console.log('[cleanup] Closing all Antigravity instances before exit...');
+    try {
+        await killIDE('agent');
+    } catch (e) {
+        console.error('[cleanup] Failed to kill agent:', e.message);
+    }
+    try {
+        await killIDE('ide');
+    } catch (e) {
+        console.error('[cleanup] Failed to kill ide:', e.message);
+    }
+    console.log('[cleanup] All Antigravity instances killed.');
+}
+
+bot.command('restart', async (ctx) => {
+    await ctx.reply(t('restart.closing'));
+    // Write flag file so next boot knows to drop pending updates
+    // (prevents the /restart command from being re-processed → infinite loop)
+    try { fs.writeFileSync(RESTART_FLAG_FILE, Date.now().toString()); } catch (_) {}
+    try {
+        await Promise.race([
+            bot.stop('SIGTERM'),
+            new Promise(r => setTimeout(r, 2000))
+        ]);
+    } catch (_) {}
+    process.exit(0);
+});
+
+bot.help((ctx) => {
+    const helpMessage = `
+${t('help.title')}
+
+${t('help.messaging_title')}
+${t('help.messaging_text')}
+
+${t('help.agent_title')}
+${t('help.agent_text')}
+
+${t('help.status_title')}
+${t('help.status_text')}
+
+${t('help.ide_title')}
+${t('help.ide_text')}
+
+${t('help.chat_title')}
+${t('help.chat_text')}
+
+${t('help.account_title')}
+${t('help.account_text')}
+    `.trim();
+    ctx.reply(helpMessage, { parse_mode: 'HTML' });
+});
+
+bot.command('start_ide', async (ctx) => {
+    const app = 'ide';
+    const running = await isIDERunning(app);
+    if (running) {
+        return ctx.reply(t('ide.already_running_short'));
+    }
+    cleanLockFile(app);
+    let startingMsg = await ctx.reply(t('ide.starting')).catch(()=>{});
+    try {
+        const appPort = getCDPPort(app);
+        await launchIDE(null, appPort, app);
+        if (startingMsg && startingMsg.message_id) {
+            ctx.deleteMessage(startingMsg.message_id).catch(()=>{});
+        }
+        ctx.reply(t('ide.started'));
+        setTimeout(() => {
+            if (autoaccept.isEnabled) autoaccept.enable(appPort).catch(()=>{});
+            const defaultModel = process.env.DEFAULT_MODEL || 'Gemini 3.1 Pro (High)';
+            selectModel(appPort, defaultModel).catch(()=>{});
+        }, 3000);
+    } catch (err) {
+        if (err.message === 'IDE_NOT_INSTALLED') {
+            ctx.reply(t('ide.not_installed'));
+        } else {
+            ctx.reply(t('ide.start_failed', { error: err.message }));
+        }
+    }
+});
+
+bot.command('start_ag', async (ctx) => {
+    const app = 'agent';
+    const running = await isIDERunning(app);
+    if (running) {
+        return ctx.reply(t('standalone.already_running'));
+    }
+    cleanLockFile(app);
+    let startingMsg = await ctx.reply(t('standalone.starting')).catch(()=>{});
+    try {
+        const appPort = getCDPPort(app);
+        await launchIDE(null, appPort, app);
+        if (startingMsg && startingMsg.message_id) {
+            ctx.deleteMessage(startingMsg.message_id).catch(()=>{});
+        }
+        ctx.reply(t('standalone.started'));
+        setTimeout(() => {
+            if (autoaccept.isEnabled) autoaccept.enable(appPort).catch(()=>{});
+            const defaultModel = process.env.DEFAULT_MODEL || 'Gemini 3.1 Pro (High)';
+            selectModel(appPort, defaultModel).catch(()=>{});
+        }, 3000);
+    } catch (err) {
+        if (err.message === 'IDE_NOT_INSTALLED') {
+            ctx.reply(t('standalone.not_installed'));
+        } else {
+            ctx.reply(t('ide.init_error', { error: err.message }));
+        }
+    }
+});
+
+bot.command('close_ide', async (ctx) => {
+    const app = 'ide';
+    const running = await isIDERunning(app);
+    if (!running) {
+        cleanLockFile(app);
+        return ctx.reply(t('ide.already_closed'));
+    }
+    let closingMsg = await ctx.reply(t('ide.closing')).catch(()=>{});
+    await killIDE(app);
+    if (closingMsg && closingMsg.message_id) {
+        ctx.deleteMessage(closingMsg.message_id).catch(()=>{});
+    }
+    ctx.reply(t('ide.closed'));
+});
+
+bot.command('close_ag', async (ctx) => {
+    const app = 'agent';
+    const running = await isIDERunning(app);
+    if (!running) {
+        cleanLockFile(app);
+        return ctx.reply(t('standalone.already_closed'));
+    }
+    let closingMsg = await ctx.reply(t('standalone.closing')).catch(()=>{});
+    await killIDE(app);
+    if (closingMsg && closingMsg.message_id) {
+        ctx.deleteMessage(closingMsg.message_id).catch(()=>{});
+    }
+    ctx.reply(t('standalone.closed'));
+});
+
+bot.command('close', async (ctx) => {
+    ctx.reply(t('close.select_prompt'));
+});
+
+bot.command('close_window', async (ctx) => {
+    let closingMsg = await ctx.reply(t('ide.closing_window') || '🪟 Closing window...').catch(()=>{});
+    const success = await closeWindow(CDP_PORT);
+    const resultMsg = success ? (t('ide.window_closed') || '✅ Window closed successfully.') : (t('ide.window_close_failed') || '❌ Failed to close window. Is there an open window?');
+    if (closingMsg && closingMsg.message_id) {
+        ctx.deleteMessage(closingMsg.message_id).catch(()=>{});
+    }
+    ctx.reply(resultMsg);
+});
+
+bot.command('closeall', async (ctx) => {
+    let closingMsg = await ctx.reply('🗂️ Closing all open file tabs...').catch(()=>{});
+    try {
+        const count = await closeAllEditors(CDP_PORT);
+        if (closingMsg && closingMsg.message_id) {
+            ctx.deleteMessage(closingMsg.message_id).catch(()=>{});
+        }
+        ctx.reply(`✅ Closed ${count} open file tab(s).`);
+    } catch (err) {
+        if (closingMsg && closingMsg.message_id) {
+            ctx.deleteMessage(closingMsg.message_id).catch(()=>{});
+        }
+        ctx.reply(`❌ Failed to close all tabs: ${err.message}`);
+    }
+});
+
+const handleStatus = async (ctx) => {
+    const isHeadless = await shouldUseHeadless(CDP_PORT);
+    if (isHeadless) {
+        let msg = '📊 <b>Antigravity Agent Status</b>\n\n';
+        msg += '🤖 <b>Mode:</b> Headless CLI Agent (<code>agy</code>)\n';
+        msg += `🧠 <b>Active Model:</b> ${getAgyModel()}\n`;
+        msg += `📁 <b>Workspace:</b> <code>${process.env.PROJECTS_DIR || '/home/orca/Agents/Main Agent'}</code>\n`;
+        msg += `💬 <b>Session:</b> ${isAgySessionActive() ? '🟢 Active Multi-turn Thread' : '⚪ Idle / Fresh Session'}\n`;
+        msg += `⚙️ <b>State:</b> ${isAgyExecuting() ? '⏳ Processing request...' : '✅ Ready for messages'}\n`;
+        msg += `📱 <b>Telegram Bot:</b> Active & Polling\n`;
+        return ctx.reply(msg, { parse_mode: 'HTML' });
+    }
+
+    let msg = t('status.report_title');
+    
+    const agentCheck = await isIDERunning('agent');
+    const ideCheck = await isIDERunning('ide');
+    
+    const agentCheckStr = agentCheck ? t('status.running_status') : t('status.stopped_status');
+    const ideCheckStr = ideCheck ? t('status.running_status') : t('status.stopped_status');
+    msg += t('status.standalone_running', { status: agentCheckStr });
+    msg += t('status.ide_running', { status: ideCheckStr });
+    
+    const activeApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
+    msg += t('status.preferred_app_status', { app: activeApp === 'agent' ? 'Standalone' : 'Classic IDE' });
+    
+    try {
+        await getActiveThreadId(CDP_PORT);
+        msg += t('status.cdp_active');
+    } catch {
+        msg += t('status.cdp_inactive');
+    }
+    
+    msg += t('status.telegram_bot');
+    
+    try {
+        const activeInfo = await getActiveThreadInfo(CDP_PORT);
+        if (activeInfo) {
+            msg += t('status.active_chat');
+            msg += t('status.project_area', { workspace: activeInfo.workspace });
+            msg += t('status.agent_title', { name: activeInfo.name });
+            const currentModel = await getCurrentModel(CDP_PORT);
+            if (currentModel) msg += t('status.selected_model', { model: currentModel });
+            const isWorking = await isAgentWorking(CDP_PORT);
+            const statusStr = isWorking ? t('status.agent_working') : t('status.agent_idle');
+            msg += t('status.agent_status', { status: statusStr });
+        }
+    } catch (e) {
+        // silently fail if we can't get chat info
+    }
+
+    msg += '\n🛡️ <b>Auto-Accept:</b> ' + (autoaccept.isEnabled ? t('status.autoaccept_on') : t('status.autoaccept_off')) + '\n';
+
+    ctx.reply(msg, { parse_mode: 'HTML' });
+};
+bot.command('status', handleStatus);
+
+/**
+ * Appends thread info and agent status footer to response text.
+ */
+async function getChatHeader(targetId = null, fallback = '') {
+    try {
+        const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId);
+        if (activeInfo) {
+            const wsName = activeInfo.workspace || 'Workspace';
+            let thName = activeInfo.name || 'Agent';
+            if (thName.length > 35) {
+                const words = thName.split(' ');
+                if (words.length > 5) {
+                    thName = words.slice(0, 5).join(' ') + '...';
+                } else {
+                    thName = thName.substring(0, 35) + '...';
+                }
+            }
+            return `📁 ${wsName}\n🤖 ${thName}\n${t('agent.swipe_to_reply')}`;
+        }
+    } catch (_) {}
+    return fallback;
+}
+
+async function buildMainMenu(overrideThread = null, overrideWorkspace = null, targetId = null) {
+    const preferredApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
+    const isIDE = preferredApp === 'ide';
+    let wsName = overrideWorkspace || 'Projects';
+    let threadName = overrideThread || null;
+    if (!overrideThread && !overrideWorkspace) {
+    try {
+        const info = await getActiveThreadInfo(CDP_PORT, targetId);
+        if (info && info.name) threadName = info.name;
+        if (info && info.workspace) {
+            wsName = info.workspace.split('/').pop() || info.workspace;
+        } else if (typeof currentWorkspaceDir !== 'undefined' && currentWorkspaceDir && currentWorkspaceDir !== config.projectsDir) {
+            wsName = require('path').basename(currentWorkspaceDir);
+        }
+    } catch(e) {
+        if (typeof currentWorkspaceDir !== 'undefined' && currentWorkspaceDir && currentWorkspaceDir !== config.projectsDir) {
+            wsName = require('path').basename(currentWorkspaceDir);
+        }
+    }
+    } // end if (!overrideThread && !overrideWorkspace)
+    let modelName = t('menu.model_not_selected');
+    try {
+        const m = await getCurrentModel(CDP_PORT);
+        if (m) {
+            // Kısalt: parantez içindekileri sil (örn. "Claude Opus 4.6 (Thinking)" -> "Claude Opus 4.6")
+            modelName = m.replace(/\s*\([^)]*\)/g, '').trim();
+        }
+    } catch(e) {}
+
+    // IDE aktifken: workspace adı göster (ör. "antigravity-bot")
+    // Standalone aktifken: agent/thread adı göster (ör. "Validating Rules...")
+    let displayTitle = 'Agent';
+    if (isIDE) {
+        // IDE mode: workspace name is primary
+        if (wsName && wsName !== 'Projects') {
+            displayTitle = wsName;
+        } else if (threadName && threadName !== 'Launchpad') {
+            displayTitle = threadName;
+        }
+    } else {
+        // Standalone mode: thread/agent name is primary
+        if (threadName && threadName !== 'Launchpad') {
+            displayTitle = threadName;
+        } else if (wsName && wsName !== 'Projects') {
+            displayTitle = wsName;
+        }
+    }
+    // Başlığı max 20 karaktere kısalt
+    if (displayTitle.length > 20) displayTitle = displayTitle.substring(0, 18) + '...';
+
+    return Markup.keyboard([
+        [`🤖 ${displayTitle}`, `🧠 ${modelName}`],
+        [
+            t('menu.btn_screenshot'), 
+            t('menu.btn_artifacts'), 
+            isTurboMode ? t('turbo.btn_on') : t('turbo.btn_off'), 
+            t('menu.btn_latest')
+        ]
+    ]).resize();
+}
+
+async function sendMainMenu(ctx, text = '🕹️ Kontrol Paneli:', overrideThread = null, overrideWorkspace = null, targetId = null, editMessageId = null) {
+    const kb = await buildMainMenu(overrideThread, overrideWorkspace, targetId);
+    const extra = { parse_mode: 'HTML', ...kb };
+    
+    if (editMessageId) {
+        // We do NOT pass kb here because kb contains a ReplyKeyboardMarkup, which Telegram API 
+        // rejects for editMessageText (it expects InlineKeyboardMarkup or none).
+        return ctx.telegram.editMessageText(ctx.chat.id, editMessageId, undefined, text, { parse_mode: 'HTML' }).catch(e => {
+            console.error('[sendMainMenu] editMessageText failed:', e.message);
+            if (!e.message.includes('message is not modified')) {
+                return ctx.reply(text, extra);
+            }
+        });
+    }
+
+    return ctx.reply(text, extra);
+}
+
+async function pushMainMenuToUser(text, silent = false) {
+    if (ALLOWED_CHAT_IDS.length === 0 || process.env.SETUP_MODE === 'true') return;
+    const kb = await buildMainMenu();
+    return Promise.all(ALLOWED_CHAT_IDS.map(id => bot.telegram.sendMessage(id, text, { ...kb, disable_notification: silent }).catch(() => {})));
+}
+
+bot.command('start', async (ctx) => {
+    await sendMainMenu(ctx, t('menu.welcome'));
+});
+
+const handleLatest = async (ctx) => {
+    try {
+        // Use the preferred target (set by workspace switch or /window command)
+        // instead of blindly picking candidates[0] which may be the wrong window
+        const targetId = getPreferredTargetId() || null;
+        let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, null, true);
+        let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
+        let buttons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
+        
+        const header = await getChatHeader(targetId, t('latest.title'));
+        await sendBotMessage(ctx, text, header, buttons);
+    } catch (err) {
+        ctx.reply(t('latest.error', { error: err.message }));
+    }
+};
+
+bot.command('latest', handleLatest);
+bot.hears(/^💬/i, handleLatest);
+
+const handleScreenshot = async (ctx) => {
+    try {
+        setReaction(ctx, REACTION.THINKING);
+        const buffer = await captureFullIDEScreenshot(CDP_PORT);
+        await ctx.replyWithPhoto({ source: buffer });
+        setReaction(ctx, null);
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('screenshot.error', { error: err.message }));
+    }
+};
+bot.command('screenshot', handleScreenshot);
+bot.hears(/^📸/i, handleScreenshot);
+
+bot.command('quota', async (ctx) => {
+    try {
+        setReaction(ctx, REACTION.THINKING);
+        const quotaInfo = await getQuota(CDP_PORT, t);
+        if (quotaInfo) {
+            ctx.reply(quotaInfo);
+        } else {
+            ctx.reply(t('quota.not_found'));
+        }
+    } catch (err) {
+        ctx.reply(t('quota.error', { error: err.message }));
+    }
+});
+
+bot.command('ask', (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    const query = parts.join(' ').trim();
+    
+    if (!query) return ctx.reply(t('ask.empty'));
+    
+    (async () => {
+        const isHeadless = await shouldUseHeadless(CDP_PORT);
+        if (isHeadless) {
+            if (isAgyExecuting()) {
+                return ctx.reply('⏳ Antigravity Agent is currently busy processing a request. Please wait a moment...');
+            }
+            setReaction(ctx, REACTION.THINKING).catch(() => {});
+            ctx.sendChatAction('typing').catch(() => {});
+            const typingInterval = setInterval(() => {
+                ctx.sendChatAction('typing').catch(() => {});
+            }, 4000);
+
+            try {
+                const responseText = await runAgyPrompt(query, {
+                    onProgress: () => ctx.sendChatAction('typing').catch(() => {})
+                });
+                clearInterval(typingInterval);
+                setReaction(ctx, REACTION.SUCCESS).catch(() => {});
+                await sendBotMessage(ctx, responseText, `🤖 Antigravity (${getAgyModel()})`, null, ctx.message.message_id);
+            } catch (err) {
+                clearInterval(typingInterval);
+                setReaction(ctx, REACTION.ERROR).catch(() => {});
+                ctx.reply(`❌ Agent Error: ${err.message}`).catch(() => {});
+            }
+            return;
+        }
+
+        try {
+            const targetId = await sendViaCDP(query, CDP_PORT);
+            setReaction(ctx, REACTION.THINKING);
+
+            // Wait briefly for message to render in DOM before anchoring state
+            await new Promise(r => setTimeout(r, 500));
+            await snapshotChatState(CDP_PORT, targetId).catch(() => {});
+            
+            if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
+            isAgentBusy = true;
+            try {
+                const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx));
+                if (isDone) {
+                    await new Promise(r => setTimeout(r, 500));
+                    let _latestRes = await getFullLatestResponse(CDP_PORT);
+                    let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
+                    let buttons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
+                    
+                    text = stripQueryFromResponse(text, query);
+                    if (!text) text = t('ask.done_empty');
+                    setReaction(ctx, null);
+                    const header = await getChatHeader(null, t('ask.done'));
+                    await sendBotMessage(ctx, text, header, buttons);
+                } else {
+                    await ctx.reply(t('ask.timeout'));
+                }
+            } finally {
+                isAgentBusy = false;
+                if (global.__taskWatcher) {
+                    global.__taskWatcher.setBusy(false);
+                    global.__taskWatcher.syncBaseline();
+                }
+            }
+        } catch (err) {
+            setReaction(ctx, null);
+            ctx.reply(t('ask.send_error', { error: err.message })).catch(() => {});
+        }
+    })();
+});
+
+
+bot.command('cmd', async (ctx) => {
+    const cmdStr = ctx.message.text.split(' ').slice(1).join(' ');
+    if (!cmdStr) {
+        return ctx.reply(t('cmd.empty'));
+    }
+    
+    ctx.reply(t('cmd.running', { cmdStr }), { parse_mode: 'MarkdownV2' });
+    
+    exec(cmdStr, { timeout: 60000, maxBuffer: 1024 * 1024 * 5 }, async (error, stdout, stderr) => {
+        let output = "";
+        if (stdout) output += `[STDOUT]\n${stdout}\n`;
+        if (stderr) output += `[STDERR]\n${stderr}\n`;
+        if (error) output += `[ERROR]\n${error.message}\n`;
+        
+        if (!output) output = t('cmd.no_output');
+        
+        await sendBotMessage(ctx, output, t('cmd.output_title'));
+    });
+});
+
+bot.command('stop', async (ctx) => {
+    try {
+        setReaction(ctx, REACTION.THINKING);
+        const stopped = await stopAgent(CDP_PORT);
+        if (stopped) {
+            ctx.reply(t('stop.stopped'));
+        } else {
+            ctx.reply(t('stop.already_stopped'));
+        }
+    } catch(e) {
+        ctx.reply(t('stop.error', { error: e.message }));
+    }
+});
+
+// ===== IDE NATIVE COMMANDS =====
+
+bot.command('goal', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    const goalText = parts.join(' ').trim();
+    
+    if (!goalText) return ctx.reply(t('native_cmd.goal_empty'));
+    
+    setReaction(ctx, REACTION.THINKING);
+    try {
+        await sendViaCDP('/goal ' + goalText, CDP_PORT);
+        setReaction(ctx, null);
+        await ctx.reply(t('native_cmd.goal_started'));
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('native_cmd.error', { error: err.message }));
+    }
+});
+
+bot.command('plan', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    const planText = parts.join(' ').trim();
+    
+    if (!planText) return ctx.reply(t('native_cmd.plan_empty'));
+    
+    setReaction(ctx, REACTION.THINKING);
+    try {
+        await sendViaCDP('/plan ' + planText, CDP_PORT);
+        setReaction(ctx, null);
+        await ctx.reply(t('native_cmd.plan_started'));
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('native_cmd.error', { error: err.message }));
+    }
+});
+
+bot.command('schedule_task', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    const scheduleText = parts.join(' ').trim();
+    
+    if (!scheduleText) return ctx.reply(t('native_cmd.schedule_empty'));
+    
+    setReaction(ctx, REACTION.THINKING);
+    try {
+        // Send as /schedule to IDE — the IDE recognizes this native command
+        await sendViaCDP('/schedule ' + scheduleText, CDP_PORT);
+        setReaction(ctx, null);
+        await ctx.reply(t('native_cmd.schedule_started'));
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('native_cmd.error', { error: err.message }));
+    }
+});
+
+// ===== CRONCREW SCHEDULE MANAGEMENT =====
+
+bot.command('schedule_setup', async (ctx) => {
+    if (!scheduleClient) return ctx.reply(t('schedule.not_configured'), { parse_mode: 'HTML' });
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    if (parts.length < 2) return ctx.reply(t('schedule.setup_usage'), { parse_mode: 'HTML' });
+    
+    const serverUrl = parts[0];
+    const licenseKey = parts.slice(1).join(' ').trim();
+    
+    setReaction(ctx, REACTION.THINKING);
+    try {
+        const result = await scheduleClient.setup(serverUrl, licenseKey);
+        setReaction(ctx, REACTION.SUCCESS);
+        ctx.reply(t('schedule.setup_success', { tier: result.tier, url: serverUrl }), { parse_mode: 'HTML' });
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('schedule.setup_error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+bot.command('schedule_status', async (ctx) => {
+    if (!scheduleClient || !scheduleClient.isConfigured()) return ctx.reply(t('schedule.not_configured'), { parse_mode: 'HTML' });
+    
+    setReaction(ctx, REACTION.THINKING);
+    try {
+        const [status, usage] = await Promise.all([
+            scheduleClient.getStatus(),
+            scheduleClient.getUsage()
+        ]);
+        
+        let msg = t('schedule.status_title');
+        msg += t('schedule.status_tier', { tier: status.tier });
+        msg += t('schedule.status_license', { status: status.status });
+        msg += t('schedule.status_usage', { today: usage.executionsToday });
+        msg += t('schedule.status_schedules', { count: usage.activeSchedules });
+        msg += t('schedule.status_changes', { used: status.changesUsed, max: status.changesMax });
+        if (status.expiresAt) msg += t('schedule.status_expires', { date: status.expiresAt });
+        
+        setReaction(ctx, null);
+        ctx.reply(msg, { parse_mode: 'HTML' });
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('schedule.error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+bot.command('schedule_list', async (ctx) => {
+    if (!scheduleClient || !scheduleClient.isConfigured()) return ctx.reply(t('schedule.not_configured'), { parse_mode: 'HTML' });
+    
+    setReaction(ctx, REACTION.THINKING);
+    try {
+        const schedules = await scheduleClient.listSchedules();
+        setReaction(ctx, null);
+        
+        if (!schedules || schedules.length === 0) {
+            return ctx.reply(t('schedule.list_empty'), { parse_mode: 'HTML' });
+        }
+        
+        let msg = t('schedule.list_title');
+        const buttons = [];
+        
+        for (const s of schedules) {
+            const icon = s.status === 'active' ? '🟢' : '⏸️';
+            const lastResult = s.last_result || '—';
+            msg += t('schedule.list_item', {
+                icon, name: s.name, cron: s.cron_expression,
+                workspace: s.workspace, runCount: s.run_count, lastResult
+            });
+            
+            const row = [];
+            if (s.status === 'active') {
+                row.push(Markup.button.callback(t('schedule.btn_run'), `sch_run_${s.id}`));
+                row.push(Markup.button.callback(t('schedule.btn_pause'), `sch_pause_${s.id}`));
+            } else {
+                row.push(Markup.button.callback(t('schedule.btn_resume'), `sch_resume_${s.id}`));
+            }
+            row.push(Markup.button.callback(t('schedule.btn_delete'), `sch_del_${s.id}`));
+            buttons.push(row);
+        }
+        
+        ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('schedule.error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+bot.command('schedule_add', async (ctx) => {
+    if (!scheduleClient || !scheduleClient.isConfigured()) return ctx.reply(t('schedule.not_configured'), { parse_mode: 'HTML' });
+    
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    const raw = parts.join(' ').trim();
+    
+    if (!raw || !raw.includes('|')) return ctx.reply(t('schedule.add_usage'), { parse_mode: 'HTML' });
+    
+    const segments = raw.split('|').map(s => s.trim());
+    if (segments.length < 4) return ctx.reply(t('schedule.add_usage'), { parse_mode: 'HTML' });
+    
+    const [name, cronExpr, workspace, ...promptParts] = segments;
+    const prompt = promptParts.join('|').trim();
+    
+    setReaction(ctx, REACTION.THINKING);
+    try {
+        const schedule = await scheduleClient.createSchedule({
+            name, cron_expression: cronExpr, workspace, prompt
+        });
+        setReaction(ctx, REACTION.SUCCESS);
+        ctx.reply(t('schedule.add_success', {
+            name: schedule.name, cron: schedule.cron_expression,
+            workspace: schedule.workspace, model: schedule.model
+        }), { parse_mode: 'HTML' });
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('schedule.add_error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+bot.command('schedule_del', async (ctx) => {
+    if (!scheduleClient || !scheduleClient.isConfigured()) return ctx.reply(t('schedule.not_configured'), { parse_mode: 'HTML' });
+    
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    const scheduleId = parts.join(' ').trim();
+    
+    if (!scheduleId) return ctx.reply(t('schedule.delete_usage'), { parse_mode: 'HTML' });
+    
+    setReaction(ctx, REACTION.THINKING);
+    try {
+        await scheduleClient.deleteSchedule(scheduleId);
+        setReaction(ctx, REACTION.SUCCESS);
+        ctx.reply(t('schedule.delete_success'), { parse_mode: 'HTML' });
+    } catch (err) {
+        setReaction(ctx, null);
+        ctx.reply(t('schedule.delete_error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+// Schedule inline button actions
+bot.action(/^sch_run_(.+)$/, async (ctx) => {
+    if (!scheduleClient) return ctx.answerCbQuery('Schedule not available', { show_alert: true });
+    const scheduleId = ctx.match[1];
+    ctx.answerCbQuery('Running...');
+    try {
+        const result = await scheduleClient.executeSchedule(scheduleId);
+        
+        // Actually send the prompt to the IDE agent
+        const targetId = getPreferredTargetId() || null;
+        await sendViaCDP(result.prompt, CDP_PORT, targetId);
+        
+        ctx.reply(t('schedule.run_success', {
+            workspace: result.workspace, model: result.model
+        }), { parse_mode: 'HTML' });
+    } catch (err) {
+        ctx.reply(t('schedule.run_error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+bot.action(/^sch_pause_(.+)$/, async (ctx) => {
+    if (!scheduleClient) return ctx.answerCbQuery('Schedule not available', { show_alert: true });
+    const scheduleId = ctx.match[1];
+    ctx.answerCbQuery('Pausing...');
+    try {
+        const result = await scheduleClient.pauseSchedule(scheduleId);
+        ctx.reply(t('schedule.pause_success', { name: result.name || scheduleId }), { parse_mode: 'HTML' });
+    } catch (err) {
+        ctx.reply(t('schedule.error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+bot.action(/^sch_resume_(.+)$/, async (ctx) => {
+    if (!scheduleClient) return ctx.answerCbQuery('Schedule not available', { show_alert: true });
+    const scheduleId = ctx.match[1];
+    ctx.answerCbQuery('Resuming...');
+    try {
+        const result = await scheduleClient.resumeSchedule(scheduleId);
+        ctx.reply(t('schedule.resume_success', { name: result.name || scheduleId }), { parse_mode: 'HTML' });
+    } catch (err) {
+        ctx.reply(t('schedule.error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+bot.action(/^sch_del_(.+)$/, async (ctx) => {
+    if (!scheduleClient) return ctx.answerCbQuery('Schedule not available', { show_alert: true });
+    const scheduleId = ctx.match[1];
+    ctx.answerCbQuery('Deleting...');
+    try {
+        await scheduleClient.deleteSchedule(scheduleId);
+        ctx.reply(t('schedule.delete_success'), { parse_mode: 'HTML' });
+    } catch (err) {
+        ctx.reply(t('schedule.error', { error: err.message }), { parse_mode: 'HTML' });
+    }
+});
+
+bot.command('new', async (ctx) => {
+    console.log('[/new] Command triggered');
+    const isHeadless = await shouldUseHeadless(CDP_PORT);
+    if (isHeadless) {
+        resetAgySession();
+        return ctx.reply('🔄 Started a new Antigravity session. What would you like to work on?');
+    }
+    try {
+        const success = await triggerNewChat(CDP_PORT);
+        console.log('[/new] triggerNewChat result:', success);
+        if (success) {
+            ctx.reply(t('new_chat.opened'));
+            setTimeout(() => {
+                const defaultModel = process.env.DEFAULT_MODEL || 'Gemini 3.1 Pro (High)';
+                selectModel(CDP_PORT, defaultModel).catch(()=>{});
+            }, 1500);
+        } else {
+            ctx.reply(t('new_chat.not_found'));
+        }
+    } catch(e) {
+        console.log('[/new] Error:', e.message);
+        ctx.reply(t('new_chat.error', { error: e.message }));
+    }
+});
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+async function renderAgentsKeyboard(workspaces, activeInfo) {
+    const inline_keyboard = [];
+    
+    // 1. Quick Recent Chats (top 4 threads across all projects)
+    const allRecent = [];
+    for (const ws of workspaces) {
+        for (const th of ws.threads) {
+            if (th.name && !/^(Ran|Worked for|Explored)\b/i.test(th.name) && !/^show\s+\d+\s+more/i.test(th.name)) {
+                allRecent.push({ ...th, workspace: ws.workspace });
+            }
+        }
+    }
+
+    const topRecent = allRecent.slice(0, 4);
+    for (const th of topRecent) {
+        const thIdx = cachedAgentThreads.findIndex(t => t.name === th.name && t.workspace === th.workspace);
+        const idx = thIdx >= 0 ? thIdx + 1 : 1;
+        let displayName = th.name.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+        if (displayName.length > 28) displayName = displayName.substring(0, 26) + '…';
+        inline_keyboard.push([{ text: `💬 ${displayName}`, callback_data: `ag_th:${idx}` }]);
+    }
+
+    // 2. Project Filter Buttons (if multiple projects exist)
+    if (workspaces.length > 1) {
+        const wsRows = [];
+        let currentRow = [];
+        workspaces.forEach((ws, wsIdx) => {
+            const count = ws.threads.filter(th => th.name && !/^(Ran|Worked for|Explored)\b/i.test(th.name)).length;
+            let wsLabel = ws.workspace.length > 16 ? ws.workspace.substring(0, 14) + '…' : ws.workspace;
+            currentRow.push({ text: `📁 ${wsLabel} (${count})`, callback_data: `ag_ws:${wsIdx}` });
+            if (currentRow.length === 2) {
+                wsRows.push(currentRow);
+                currentRow = [];
+            }
+        });
+        if (currentRow.length > 0) wsRows.push(currentRow);
+        inline_keyboard.push(...wsRows);
+    }
+
+    // 3. Action Buttons Row
+    inline_keyboard.push([
+        { text: t('agents.refresh_btn') || '🔄 Refresh', callback_data: 'ag_refresh' },
+        { text: t('agents.close_btn') || '❌ Close', callback_data: 'ag_close' }
+    ]);
+
+    const activeChat = activeInfo?.name || '—';
+    const activeProject = activeInfo?.workspace || 'Default';
+    const text = t('agents.menu_title', {
+        activeChat: escapeHtml(activeChat),
+        activeProject: escapeHtml(activeProject)
+    });
+
+    return { text, reply_markup: { inline_keyboard } };
+}
+
+function renderProjectThreadsKeyboard(ws, wsIdx) {
+    const inline_keyboard = [];
+    const validThreads = ws.threads.filter(th => th.name && !/^(Ran|Worked for|Explored)\b/i.test(th.name));
+    
+    for (const th of validThreads) {
+        const thIdx = cachedAgentThreads.findIndex(t => t.name === th.name && t.workspace === ws.workspace);
+        const idx = thIdx >= 0 ? thIdx + 1 : 1;
+        let displayName = th.name.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+        if (displayName.length > 32) displayName = displayName.substring(0, 30) + '…';
+        const timeStr = th.time ? ` (${th.time})` : '';
+        inline_keyboard.push([{ text: `💬 ${displayName}${timeStr}`, callback_data: `ag_th:${idx}` }]);
+    }
+
+    inline_keyboard.push([
+        { text: t('agents.all_projects_btn') || '⬅️ All Projects', callback_data: 'ag_back' },
+        { text: t('agents.close_btn') || '❌ Close', callback_data: 'ag_close' }
+    ]);
+
+    const text = t('agents.project_view_title', {
+        workspace: escapeHtml(ws.workspace),
+        count: validThreads.length
+    });
+
+    return { text, reply_markup: { inline_keyboard } };
+}
+
+async function executeAgentThreadSwitch(ctx, thread, isCallback = false) {
+    const targetId = await switchAgentThread(CDP_PORT, thread.name, thread.workspace, thread.threadId);
+    if (!targetId) {
+        const errMsg = t('agents.not_found') || '❌ Thread could not be selected.';
+        if (isCallback) {
+            try { await ctx.answerCbQuery(errMsg, { show_alert: true }); } catch(_) {}
+        } else {
+            await ctx.reply(errMsg);
+        }
+        return false;
+    }
+
+    setPreferredWindow(null);
+    if (thread.workspace) setActiveWorkspace(thread.workspace);
+    await snapshotChatState(CDP_PORT, targetId, thread.name).catch(() => {});
+
+    const successMsg = t('agents.switched', { name: escapeHtml(thread.name) });
+    if (isCallback) {
+        try { await ctx.answerCbQuery(t('agents.switched_plain', { name: thread.name })); } catch(_) {}
+        try { await ctx.deleteMessage(); } catch (_) {
+            try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (__) {}
+        }
+    }
+
+    await sendMainMenu(ctx, successMsg, thread.name, thread.workspace);
+    return true;
+}
+
+async function renderAndSendAgentThreads(ctx, port, editMessageId = null) {
+    const workspaces = await listAgentThreads(port);
+    if (!workspaces || workspaces.length === 0) {
+        if (editMessageId) {
+            return ctx.editMessageText(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
+        }
+        return ctx.reply(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
+    }
+
+    cachedWorkspacesList = workspaces;
+    cachedAgentThreads = [];
+
+    for (const ws of workspaces) {
+        for (const th of ws.threads) {
+            if (th.name && !/^(Ran|Worked for|Explored)\b/i.test(th.name) && !/^show\s+\d+\s+more/i.test(th.name)) {
+                let threadId = th.threadId || null;
+                if (!threadId && th.href) {
+                    const match = th.href.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                    if (match) threadId = match[1];
+                }
+                cachedAgentThreads.push({ ...th, workspace: ws.workspace, threadId });
+            }
+        }
+    }
+
+    if (cachedAgentThreads.length === 0) {
+        if (editMessageId) {
+            return ctx.editMessageText(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
+        }
+        return ctx.reply(t('agents.no_recent') || 'ℹ️ No recent active threads found.');
+    }
+
+    const activeInfo = await getActiveThreadInfo(port).catch(() => null);
+    const view = await renderAgentsKeyboard(workspaces, activeInfo);
+
+    if (editMessageId) {
+        try {
+            await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+            return;
+        } catch (e) {
+            console.debug('[renderAndSendAgentThreads] editMessageText fallback:', e.message);
+        }
+    }
+
+    await ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+}
+
+bot.command('agents', async (ctx) => {
+    const rawText = ctx.message.text.trim();
+    const query = rawText.replace(/^\/agents(@\w+)?\s*/i, '').trim();
+
+    // 1. If no query or empty -> render interactive UI
+    if (!query) {
+        try {
+            await renderAndSendAgentThreads(ctx, CDP_PORT);
+        } catch (e) {
+            ctx.reply((t('agents.error') || '❌ Error: ') + e.message);
+        }
+        return;
+    }
+
+    // 2. If query is a number N -> switch directly
+    const num = parseInt(query, 10);
+    if (!isNaN(num) && String(num) === query) {
+        if (num > 0 && num <= cachedAgentThreads.length) {
+            const thread = cachedAgentThreads[num - 1];
+            await executeAgentThreadSwitch(ctx, thread, false);
+        } else {
+            ctx.reply(t('agents.invalid_number') || '❌ Invalid thread number.');
+        }
+        return;
+    }
+
+    // 3. Keyword Search (e.g. /agents dertli or /agents model)
+    if (cachedAgentThreads.length === 0) {
+        await listAgentThreads(CDP_PORT).then(workspaces => {
+            cachedWorkspacesList = workspaces;
+            cachedAgentThreads = [];
+            for (const ws of workspaces) {
+                for (const th of ws.threads) {
+                    if (th.name && !/^(Ran|Worked for|Explored)\b/i.test(th.name)) {
+                        let threadId = th.threadId || null;
+                        if (!threadId && th.href) {
+                            const match = th.href.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                            if (match) threadId = match[1];
+                        }
+                        cachedAgentThreads.push({ ...th, workspace: ws.workspace, threadId });
+                    }
+                }
+            }
+        }).catch(() => {});
+    }
+
+    const normalize = s => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const queryNorm = normalize(query);
+    const matches = cachedAgentThreads.filter(th => {
+        return normalize(th.name).includes(queryNorm) || normalize(th.workspace).includes(queryNorm);
+    });
+
+    if (matches.length === 1) {
+        await executeAgentThreadSwitch(ctx, matches[0], false);
+    } else if (matches.length > 1) {
+        const inline_keyboard = [];
+        matches.slice(0, 8).forEach(th => {
+            const idx = cachedAgentThreads.indexOf(th) + 1;
+            let label = `💬 ${th.name.length > 28 ? th.name.substring(0, 26) + '…' : th.name} (${th.workspace})`;
+            inline_keyboard.push([{ text: label, callback_data: `ag_th:${idx}` }]);
+        });
+        inline_keyboard.push([{ text: t('agents.close_btn') || '❌ Close', callback_data: 'ag_close' }]);
+        await ctx.reply(t('agents.search_found_multi', { query: escapeHtml(query) }), {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard }
+        });
+    } else {
+        await ctx.reply(t('agents.search_not_found', { query: escapeHtml(query) }));
+    }
+});
+
+bot.action(/^ag_th:(\d+)$/, async (ctx) => {
+    const num = parseInt(ctx.match[1], 10);
+    if (num > 0 && num <= cachedAgentThreads.length) {
+        const thread = cachedAgentThreads[num - 1];
+        await executeAgentThreadSwitch(ctx, thread, true);
+    } else {
+        try { await ctx.answerCbQuery(t('agents.invalid_number') || '❌ Invalid thread number.', { show_alert: true }); } catch(_) {}
+    }
+});
+
+bot.action(/^ag_ws:(\d+)$/, async (ctx) => {
+    const wsIdx = parseInt(ctx.match[1], 10);
+    if (wsIdx >= 0 && wsIdx < cachedWorkspacesList.length) {
+        const ws = cachedWorkspacesList[wsIdx];
+        const view = renderProjectThreadsKeyboard(ws, wsIdx);
+        try {
+            await ctx.answerCbQuery();
+            await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+        } catch (e) {
+            console.debug('[ag_ws] edit failed:', e.message);
+        }
+    } else {
+        try { await ctx.answerCbQuery(); } catch(_) {}
+    }
+});
+
+bot.action('ag_back', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const activeInfo = await getActiveThreadInfo(CDP_PORT).catch(() => null);
+        const view = await renderAgentsKeyboard(cachedWorkspacesList, activeInfo);
+        await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+    } catch (e) {
+        console.debug('[ag_back] edit failed:', e.message);
+    }
+});
+
+bot.action('ag_refresh', async (ctx) => {
+    try {
+        await ctx.answerCbQuery(t('agents.refresh_btn') || '🔄 Refreshing...');
+        await renderAndSendAgentThreads(ctx, CDP_PORT, ctx.callbackQuery?.message?.message_id);
+    } catch (e) {
+        console.debug('[ag_refresh] failed:', e.message);
+    }
+});
+
+bot.action('ag_close', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        await ctx.deleteMessage().catch(() => {
+            ctx.editMessageText('❌', { reply_markup: { inline_keyboard: [] } }).catch(() => {});
+        });
+    } catch (_) {}
+});
+
+bot.hears(/^\/agents_(\d+)$/, async (ctx) => {
+    const num = parseInt(ctx.match[1], 10);
+    if (num > 0 && num <= cachedAgentThreads.length) {
+        const thread = cachedAgentThreads[num - 1];
+        await executeAgentThreadSwitch(ctx, thread, false);
+    } else {
+        ctx.reply(t('agents.invalid_number') || '❌ Invalid thread number.');
+    }
+});
+
+bot.hears(/^(\d+)$/, async (ctx, next) => {
+    const num = parseInt(ctx.match[1], 10);
+    if (cachedAgentThreads.length > 0 && num > 0 && num <= cachedAgentThreads.length) {
+        const thread = cachedAgentThreads[num - 1];
+        await executeAgentThreadSwitch(ctx, thread, false);
+        return;
+    }
+    return next();
+});
+
+const lastUploadedMtimes = new Map();
+let artifactWatchers = new Map();
+const artifactDebounceTimers = new Map();
+
+function getArtifactButtons(conversationId) {
+    if (!conversationId) return [];
+
+    const driver = DriverFactory.getDriver();
+    const conversationDir = driver.getConversationDir(conversationId);
+
+    if (!fs.existsSync(conversationDir)) return [];
+
+    const mdFiles = [];
+    
+    // Scan root of conversationDir
+    try {
+        const rootFiles = fs.readdirSync(conversationDir);
+        for (const f of rootFiles) {
+            if (f.endsWith('.md')) {
+                mdFiles.push({ name: f, path: path.join(conversationDir, f) });
+            }
+        }
+    } catch (e) {}
+
+    // Scan artifacts subdirectory
+    const artifactsDir = path.join(conversationDir, 'artifacts');
+    if (fs.existsSync(artifactsDir)) {
+        try {
+            const artFiles = fs.readdirSync(artifactsDir);
+            for (const f of artFiles) {
+                if (f.endsWith('.md')) {
+                    mdFiles.push({ name: f, path: path.join(artifactsDir, f) });
+                }
+            }
+        } catch (e) {}
+    }
+
+    const titleMap = {
+        'task.md': '📋 Task',
+        'implementation_plan.md': '🗒️ Plan',
+        'walkthrough.md': '📖 Walkthrough'
+    };
+
+    const buttons = [];
+    for (const file of mdFiles) {
+        const mapping = telegraphPublisher.getPageMapping(file.path);
+        if (mapping && mapping.url) {
+            let label = titleMap[file.name];
+            if (!label) {
+                const defaultTitle = file.name.replace(/\.md$/, '').replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                label = `📄 ${defaultTitle}`;
+            }
+            // Avoid duplicate buttons if the same file is somehow pushed twice
+            if (!buttons.some(b => b.url === mapping.url)) {
+                buttons.push({ text: label, url: mapping.url });
+            }
+        }
+    }
+
+    // Chunk buttons into rows of 2
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 2) {
+        rows.push(buttons.slice(i, i + 2));
+    }
+    
+    return rows;
+}
+
+function formatMarkdownForTelegram(markdownText) {
+    let text = markdownText || '';
+    
+    // Convert code blocks ```lang ... ``` to <pre><code>...</code></pre>
+    const preBlocks = [];
+    text = text.replace(/```[a-zA-Z0-9_-]*\n?([\s\S]*?)```/g, (match, code) => {
+        preBlocks.push(`<pre><code>${escHtml(code.trim())}</code></pre>`);
+        return `___PRE_BLOCK_${preBlocks.length - 1}___`;
+    });
+
+    // Escape raw HTML outside of pre blocks
+    text = escHtml(text);
+
+    // Re-insert pre blocks
+    text = text.replace(/___PRE_BLOCK_(\d+)___/g, (match, idx) => preBlocks[parseInt(idx, 10)]);
+
+    // Headers (# Header)
+    text = text.replace(/^### (.*$)/gim, '<b>$1</b>');
+    text = text.replace(/^## (.*$)/gim, '<b><u>$1</u></b>');
+    text = text.replace(/^# (.*$)/gim, '<b><u>$1</u></b>');
+
+    // Bold **text**
+    text = text.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+    
+    // Inline code `code`
+    text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // Bullet points (- or *)
+    text = text.replace(/^[ \t]*[*|-][ \t]+(.*$)/gim, '• $1');
+
+    return text.trim();
+}
+
+async function sendFormattedTelegramMessage(botInstance, chatId, title, rawContent, inlineKeyboard = []) {
+    const formattedBody = formatMarkdownForTelegram(rawContent);
+    const header = `📝 <b>${escHtml(title)}</b>\n\n`;
+    const fullText = header + formattedBody;
+
+    const MAX_LEN = 3800;
+    if (fullText.length <= MAX_LEN) {
+        return await botInstance.telegram.sendMessage(chatId, fullText, {
+            parse_mode: 'HTML',
+            reply_markup: inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined
+        });
+    }
+
+    const lines = fullText.split('\n');
+    let currentChunk = '';
+    const chunks = [];
+
+    for (const line of lines) {
+        if ((currentChunk + '\n' + line).length > MAX_LEN) {
+            if (currentChunk.length > 0) {
+                chunks.push(currentChunk);
+                currentChunk = '';
+            }
+            if (line.length > MAX_LEN) {
+                let remaining = line;
+                while (remaining.length > 0) {
+                    chunks.push(remaining.slice(0, MAX_LEN));
+                    remaining = remaining.slice(MAX_LEN);
+                }
+            } else {
+                currentChunk = line;
+            }
+        } else {
+            currentChunk = currentChunk ? (currentChunk + '\n' + line) : line;
+        }
+    }
+    if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+    }
+
+    let lastSent = null;
+    for (let i = 0; i < chunks.length; i++) {
+        const isLast = (i === chunks.length - 1);
+        const keyboard = isLast && inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined;
+        lastSent = await botInstance.telegram.sendMessage(chatId, chunks[i], {
+            parse_mode: 'HTML',
+            reply_markup: keyboard
+        });
+    }
+    return lastSent;
+}
+
+function watchArtifacts(conversationId, retry = 0) {
+    if (!conversationId) return;
+
+    const driver = DriverFactory.getDriver();
+    const conversationDir = driver.getConversationDir(conversationId);
+
+    if (artifactWatchers.has(conversationDir)) return; // Already watching this folder!
+
+    if (!fs.existsSync(conversationDir)) {
+        if (retry < 5) {
+            setTimeout(() => watchArtifacts(conversationId, retry + 1), 2000);
+        }
+        return;
+    }
+
+    const isWatchable = (name) => name.endsWith('.md');
+
+    try {
+        const watcher = fs.watch(conversationDir, { recursive: true }, (eventType, filename) => {
+            if (!filename) return;
+            const normalizedFilename = filename.split(/[/\\]/).pop();
+            if (isWatchable(normalizedFilename)) {
+                let filePath = path.join(conversationDir, filename);
+
+                if (artifactDebounceTimers.has(filePath)) {
+                    clearTimeout(artifactDebounceTimers.get(filePath));
+                }
+
+                const timer = setTimeout(async () => {
+                    artifactDebounceTimers.delete(filePath);
+
+                    // Resolve the real path — on Windows, fs.watch may report only the basename
+                    // while the file actually lives in the artifacts/ subdirectory (or vice-versa)
+                    let resolvedFilePath = filePath;
+                    if (!fs.existsSync(resolvedFilePath)) {
+                        const fallbackRoot = path.join(conversationDir, normalizedFilename);
+                        const fallbackArtifacts = path.join(conversationDir, 'artifacts', normalizedFilename);
+                        if (fs.existsSync(fallbackRoot)) {
+                            resolvedFilePath = fallbackRoot;
+                        } else if (fs.existsSync(fallbackArtifacts)) {
+                            resolvedFilePath = fallbackArtifacts;
+                        } else {
+                            return;
+                        }
+                    }
+
+                    try {
+                        const stat = fs.statSync(resolvedFilePath);
+                        const lastMtime = lastUploadedMtimes.get(resolvedFilePath);
+                        if (lastMtime && stat.mtimeMs <= lastMtime) {
+                            return;
+                        }
+                        lastUploadedMtimes.set(resolvedFilePath, stat.mtimeMs);
+
+                        console.log(`[Artifact Watcher] Detected update for ${normalizedFilename}...`);
+                        const title = normalizedFilename.replace(/\.md$/, '').replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                        const url = await telegraphPublisher.publishOrUpdateArtifact(resolvedFilePath, title);
+                        const pathId = getPathId(resolvedFilePath);
+
+                        if (url) {
+                            console.log(`[Telegraph Watcher] Published ${normalizedFilename} to ${url}`);
+                            
+                            // Send/update Telegram message with link
+                            const lastMsg = lastSentMessageIdMap.get('current') || Array.from(lastSentMessageIdMap.values()).pop();
+                            if (lastMsg && lastMsg.messageId) {
+                                const lookupChatId = lastMsg.chatId;
+                                const inlineKeyboard = getArtifactButtons(conversationId);
+                                const res = await bot.telegram.editMessageReplyMarkup(lookupChatId, lastMsg.messageId, undefined, {
+                                    inline_keyboard: inlineKeyboard
+                                }).catch(err => {
+                                    console.error('[Telegraph Watcher] Failed to update message keyboard:', err.message);
+                                });
+                                if (res && typeof res === 'object') {
+                                    lastSentMessageIdMap.set(lookupChatId, { ...lastMsg, baseKeyboard: { ...lastMsg.baseKeyboard, reply_markup: { inline_keyboard: inlineKeyboard } } });
+                                }
+                            } else {
+                                const msg = `📝 <b>${title} Updated!</b>\n\nRead on Telegraph:\n${url}`;
+                                for (const chatId of ALLOWED_CHAT_IDS) {
+                                    bot.telegram.sendMessage(chatId, msg, { 
+                                        parse_mode: 'HTML',
+                                        reply_markup: { inline_keyboard: [[{ text: '🌐 Open Artifact', url: url }]] }
+                                    }).catch(err => {
+                                        console.error(`[Telegraph Watcher] Failed to send message to ${chatId}:`, err.message);
+                                    });
+                                }
+                            }
+                        } else {
+                            // Telegraph disabled (Default) — send formatted artifact directly to Telegram chat
+                            const rawContent = fs.readFileSync(resolvedFilePath, 'utf-8');
+                            const inlineKeyboard = [[{ text: '📄 Download File', callback_data: `ff_${pathId}` }]];
+
+                            for (const chatId of ALLOWED_CHAT_IDS) {
+                                await sendFormattedTelegramMessage(bot, chatId, title, rawContent, inlineKeyboard).catch(err => {
+                                    console.error(`[Artifact Watcher] Failed to send artifact to ${chatId}:`, err.message);
+                                });
+                            }
+                        }
+                    } catch (err) {
+                        console.error(`[Artifact Watcher] Error processing artifact ${normalizedFilename}:`, err.stack);
+                    }
+                }, 3000);
+
+                artifactDebounceTimers.set(filePath, timer);
+            }
+        });
+        artifactWatchers.set(conversationDir, watcher);
+        console.log(`[Artifact Watcher] Watching artifacts for directory: ${conversationDir}`);
+    } catch (e) {
+        console.error('[Artifact Watcher] Failed to start watcher:', e.message);
+    }
+}
+
+async function handleGetArtifactCommand(ctx, fileName, title) {
+    try {
+        const conversationId = getLastResolvedThreadId();
+        if (!conversationId) {
+            return ctx.reply(`⚠️ No active thread found. Please select a thread in the IDE first.`);
+        }
+
+        const driver = DriverFactory.getDriver();
+        const conversationDir = driver.getConversationDir(conversationId);
+
+        let filePath = path.join(conversationDir, fileName);
+        if (!fs.existsSync(filePath)) {
+            filePath = path.join(conversationDir, 'artifacts', fileName);
+        }
+
+        if (!fs.existsSync(filePath)) {
+            return ctx.reply(`⚠️ <b>${title}</b> is not available for this chat yet.`, { parse_mode: 'HTML' });
+        }
+
+        const pathId = getPathId(filePath);
+        const buttons = [];
+        const row = [];
+        
+        const mapping = telegraphPublisher.getPageMapping(filePath);
+        if (mapping && mapping.url) {
+            row.push({ text: `🌐 Open ${title}`, url: mapping.url });
+        }
+        row.push({ text: `📄 Get File`, callback_data: `ff_${pathId}` });
+        buttons.push(row);
+
+        const rawContent = fs.readFileSync(filePath, 'utf-8');
+        if (telegraphPublisher.isTelegraphEnabled()) {
+            ctx.reply(`📝 <b>${title}</b> for current chat:`, {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: buttons }
+            });
+        } else {
+            await sendFormattedTelegramMessage(bot, ctx.chat.id, title, rawContent, buttons);
+        }
+    } catch (e) {
+        ctx.reply(`❌ Error getting ${title}: ` + e.message);
+    }
+}
+
+bot.command('gettask', ctx => handleGetArtifactCommand(ctx, 'task.md', 'Task Checklist'));
+bot.command('getplan', ctx => handleGetArtifactCommand(ctx, 'implementation_plan.md', 'Implementation Plan'));
+bot.command('getwalk', ctx => handleGetArtifactCommand(ctx, 'walkthrough.md', 'Walkthrough'));
+
+// ===== TELEGRAPH TOGGLE & WIPE COMMANDS =====
+
+const handleTelegraph = async (ctx) => {
+    try {
+        const text = (ctx.message?.text || '').trim();
+        const parts = text.split(/\s+/);
+        const subCommand = (parts[1] || '').toLowerCase();
+
+        if (subCommand === 'on' || subCommand === 'enable') {
+            process.env.ENABLE_TELEGRAPH = 'true';
+            return ctx.reply(t('telegraph.enabled'), { parse_mode: 'HTML' });
+        } else if (subCommand === 'off' || subCommand === 'disable') {
+            process.env.ENABLE_TELEGRAPH = 'false';
+            return ctx.reply(t('telegraph.disabled'), { parse_mode: 'HTML' });
+        } else {
+            const isEnabled = telegraphPublisher.isTelegraphEnabled();
+            const stateStr = isEnabled ? t('telegraph.state_on') : t('telegraph.state_off');
+            const msg = t('telegraph.status', { state: stateStr });
+            const buttons = [
+                [
+                    { text: isEnabled ? t('telegraph.btn_turn_off') : t('telegraph.btn_turn_on'), callback_data: 'telegraph_toggle' },
+                    { text: '🗑️ ' + t('telegraph.btn_wipe'), callback_data: 'telegraph_wipe' }
+                ],
+                [
+                    { text: '🔄 ' + (t('menu.btn_status') || 'Status'), callback_data: 'telegraph_status' }
+                ]
+            ];
+            return ctx.reply(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+        }
+    } catch (e) {
+        ctx.reply('❌ Error: ' + e.message);
+    }
+};
+
+const handleClearTelegraph = async (ctx) => {
+    try {
+        await ctx.reply(t('telegraph.wiping'));
+        const count = await telegraphPublisher.wipePublishedPages();
+        await ctx.reply(t('telegraph.wiped', { count }));
+    } catch (err) {
+        await ctx.reply('❌ Failed to clear Telegraph pages: ' + err.message);
+    }
+};
+
+bot.command('telegraph', handleTelegraph);
+bot.command('cleartelegraph', handleClearTelegraph);
+
+bot.action('telegraph_toggle', async (ctx) => {
+    try {
+        const current = telegraphPublisher.isTelegraphEnabled();
+        process.env.ENABLE_TELEGRAPH = current ? 'false' : 'true';
+        const isEnabled = telegraphPublisher.isTelegraphEnabled();
+        await ctx.answerCbQuery(isEnabled ? 'Telegraph Enabled' : 'Telegraph Disabled');
+        
+        const stateStr = isEnabled ? t('telegraph.state_on') : t('telegraph.state_off');
+        const msg = t('telegraph.status', { state: stateStr });
+        const buttons = [
+            [
+                { text: isEnabled ? t('telegraph.btn_turn_off') : t('telegraph.btn_turn_on'), callback_data: 'telegraph_toggle' },
+                { text: '🗑️ ' + t('telegraph.btn_wipe'), callback_data: 'telegraph_wipe' }
+            ],
+            [
+                { text: '🔄 ' + (t('menu.btn_status') || 'Status'), callback_data: 'telegraph_status' }
+            ]
+        ];
+        await ctx.editMessageText(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } }).catch(() => {});
+    } catch (e) {
+        ctx.reply('❌ Error toggling Telegraph: ' + e.message);
+    }
+});
+
+bot.action('telegraph_wipe', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Wiping pages...');
+        const count = await telegraphPublisher.wipePublishedPages();
+        ctx.reply(t('telegraph.wiped', { count }));
+    } catch (e) {
+        ctx.reply('❌ Error wiping Telegraph pages: ' + e.message);
+    }
+});
+
+bot.action('telegraph_status', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Refreshing...');
+        const isEnabled = telegraphPublisher.isTelegraphEnabled();
+        const stateStr = isEnabled ? t('telegraph.state_on') : t('telegraph.state_off');
+        const msg = t('telegraph.status', { state: stateStr });
+        const buttons = [
+            [
+                { text: isEnabled ? t('telegraph.btn_turn_off') : t('telegraph.btn_turn_on'), callback_data: 'telegraph_toggle' },
+                { text: '🗑️ ' + t('telegraph.btn_wipe'), callback_data: 'telegraph_wipe' }
+            ],
+            [
+                { text: '🔄 ' + (t('menu.btn_status') || 'Status'), callback_data: 'telegraph_status' }
+            ]
+        ];
+        await ctx.editMessageText(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } }).catch(() => {});
+    } catch (e) {}
+});
+
+const handleArtifacts = async (ctx) => {
+    try {
+        const driver = DriverFactory.getDriver();
+        const brainPath = driver.brainPath;
+        
+        // Helper to check if a file should be listed as an artifact
+        const ARTIFACT_EXTENSIONS = ['.md', '.png', '.jpg', '.jpeg', '.webp', '.mp4', '.mov', '.gif', '.pdf', '.txt', '.json', '.csv', '.html'];
+        const isArtifactFile = (name) => {
+            if (name.includes('.metadata.json') || name.includes('.resolved') || name.startsWith('.sys') || name.startsWith('.')) return false;
+            return ARTIFACT_EXTENSIONS.some(ext => name.endsWith(ext));
+        };
+        const getMtime = (filePath) => {
+            try { return fs.statSync(filePath).mtimeMs; } catch (_) { return 0; }
+        };
+
+        // Try to get the active thread info for workspace filtering
+        let threadInfo = null;
+        try { threadInfo = await getActiveThreadInfo(CDP_PORT, getPreferredTargetId()); } catch (_) {}
+        const workspaceName = threadInfo?.workspace?.split(' - ')?.[0]?.trim()?.toLowerCase() || null;
+        
+        // Strategy: Try known thread ID first, then active thread from DOM, then scan all conversations
+        let conversationId = getLastResolvedThreadId();
+        
+        if (!conversationId) {
+            // Force resolution of the active thread if not already set (e.g. immediately after a restart)
+            try { 
+                conversationId = await getActiveThreadId(CDP_PORT, getPreferredTargetId());
+                if (conversationId) {
+                    // Update the cached thread ID so we don't have to query the DOM again
+                    setLastResolvedThreadId(conversationId);
+                }
+            } catch (_) {}
+            
+            if (!conversationId) {
+                try { await getFullLatestResponse(CDP_PORT, getPreferredTargetId()); } catch (_) {}
+                conversationId = getLastResolvedThreadId();
+            }
+        }
+
+        let conversationDir = conversationId ? path.join(brainPath, conversationId) : null;
+        
+        // Quick check: does this conversation actually have RECENT artifacts?
+        // We also verify the conversation is recent (active within last 2 hours)
+        // to avoid showing stale artifacts from old conversations.
+        let hasArtifacts = false;
+        if (conversationDir && fs.existsSync(conversationDir)) {
+            const items = fs.readdirSync(conversationDir, { withFileTypes: true });
+            const hasFiles = items.some(i => !i.isDirectory() && isArtifactFile(i.name)) || 
+                           fs.existsSync(path.join(conversationDir, 'artifacts'));
+            
+            if (hasFiles) {
+                // Check if this conversation is still recent — avoid showing artifacts
+                // from a weeks-old conversation just because lastResolvedThreadId points to it
+                const tp = path.join(conversationDir, '.system_generated', 'logs', 'transcript.jsonl');
+                let isRecent = false;
+                try {
+                    if (fs.existsSync(tp)) {
+                        const mtime = fs.statSync(tp).mtimeMs;
+                        isRecent = (Date.now() - mtime) < 2 * 60 * 60 * 1000; // 2 hours
+                    }
+                } catch (_) {}
+                
+                if (isRecent) {
+                    hasArtifacts = true;
+                } else {
+                    console.log(`[handleArtifacts] lastResolvedThreadId ${conversationId?.substring(0, 8)} has artifacts but is stale — scanning brain...`);
+                }
+            }
+        }
+        
+        // If no artifacts found via lastResolvedThreadId, scan ALL conversations
+        // sorted by most recently modified
+        if (!hasArtifacts && fs.existsSync(brainPath)) {
+            console.log(`[handleArtifacts] lastResolvedThreadId ${conversationId?.substring(0, 8) || 'null'} has no artifacts — scanning brain for most recent...`);
+            const dirs = fs.readdirSync(brainPath, { withFileTypes: true })
+                .filter(d => d.isDirectory())
+                .map(d => {
+                    const dir = path.join(brainPath, d.name);
+                    const tp = path.join(dir, '.system_generated', 'logs', 'transcript.jsonl');
+                    let mtime = 0;
+                    try { if (fs.existsSync(tp)) mtime = fs.statSync(tp).mtimeMs; } catch (_) {}
+                    return { name: d.name, dir, mtime };
+                })
+                .filter(d => d.mtime > 0)
+                .sort((a, b) => b.mtime - a.mtime);
+            
+            for (const dir of dirs) {
+                // Check if this conversation has artifacts
+                const items = fs.readdirSync(dir.dir, { withFileTypes: true });
+                const dirHasArtifacts = items.some(i => !i.isDirectory() && isArtifactFile(i.name)) ||
+                                        fs.existsSync(path.join(dir.dir, 'artifacts'));
+                if (!dirHasArtifacts) continue;
+                
+                conversationId = dir.name;
+                conversationDir = dir.dir;
+                console.log(`[handleArtifacts] Found artifacts in most recent conversation ${dir.name.substring(0, 8)}`);
+                break;
+            }
+        }
+        
+        if (!conversationDir || !fs.existsSync(conversationDir)) {
+            return ctx.reply(t('artifacts.no_active_thread') || '⚠️ No active thread found. Please select a thread in the IDE first.');
+        }
+
+        cachedArtifacts = [];
+
+        // 1. Scan artifacts/ subdirectory
+        const artifactsSubDir = path.join(conversationDir, 'artifacts');
+        if (fs.existsSync(artifactsSubDir)) {
+            const items = fs.readdirSync(artifactsSubDir, { withFileTypes: true });
+            for (const item of items) {
+                if (item.isDirectory()) continue;
+                if (isArtifactFile(item.name)) {
+                    const filePath = path.join(artifactsSubDir, item.name);
+                    cachedArtifacts.push({ name: item.name, path: filePath, mtime: getMtime(filePath) });
+                }
+            }
+        }
+
+        // 2. Scan conversation root
+        const rootItems = fs.readdirSync(conversationDir, { withFileTypes: true });
+        for (const item of rootItems) {
+            if (item.isDirectory()) continue;
+            if (isArtifactFile(item.name)) {
+                const filePath = path.join(conversationDir, item.name);
+                cachedArtifacts.push({ name: item.name, path: filePath, mtime: getMtime(filePath) });
+            }
+        }
+
+        // 3. Scan scratch/ subdirectory for temporary files
+        const scratchDir = path.join(conversationDir, 'scratch');
+        if (fs.existsSync(scratchDir)) {
+            const scratchItems = fs.readdirSync(scratchDir, { withFileTypes: true });
+            for (const item of scratchItems) {
+                if (item.isDirectory()) continue;
+                const filePath = path.join(scratchDir, item.name);
+                cachedArtifacts.push({ name: `scratch/${item.name}`, path: filePath, mtime: getMtime(filePath) });
+            }
+        }
+
+        // 4. Scan browser/ subdirectory for browser recordings
+        const browserDir = path.join(conversationDir, 'browser');
+        if (fs.existsSync(browserDir)) {
+            const browserItems = fs.readdirSync(browserDir, { withFileTypes: true });
+            for (const item of browserItems) {
+                if (item.isDirectory()) continue;
+                if (isArtifactFile(item.name)) {
+                    const filePath = path.join(browserDir, item.name);
+                    cachedArtifacts.push({ name: `🌐 ${item.name}`, path: filePath, mtime: getMtime(filePath) });
+                }
+            }
+        }
+
+        if (cachedArtifacts.length === 0) {
+            return ctx.reply(t('artifacts.no_artifacts') || 'ℹ️ No artifacts found for the current thread.');
+        }
+
+        // Sort by modification time, newest first
+        cachedArtifacts.sort((a, b) => b.mtime - a.mtime);
+
+        let msg = t('artifacts.list_title') || '📎 <b>Artifacts for Current Thread:</b>\n\n';
+        const msgs = [];
+        for (let i = 0; i < cachedArtifacts.length; i++) {
+            const filename = cachedArtifacts[i].name;
+            let displayName = filename;
+            if (filename.startsWith('media__')) {
+                const match = filename.match(/media__(\d+)\.\w+/);
+                if (match) {
+                    const date = new Date(parseInt(match[1], 10));
+                    const today = new Date();
+                    const yesterday = new Date(today);
+                    yesterday.setDate(yesterday.getDate() - 1);
+                    
+                    let dateStr = '';
+                    if (date.toDateString() === today.toDateString()) dateStr = 'Today';
+                    else if (date.toDateString() === yesterday.toDateString()) dateStr = 'Yesterday';
+                    else dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                    
+                    const timeStr = date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+                    displayName = `Media (${dateStr} ${timeStr})`;
+                }
+            } else {
+                displayName = filename.replace(/\.[^/.]+$/, "").replace(/_/g, ' ').split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+            }
+            let line = `/artifact_${i + 1} - ${displayName}`;
+            const mapping = telegraphPublisher.getPageMapping(cachedArtifacts[i].path);
+            if (mapping && mapping.url) {
+                line += ` [🌐 <a href="${mapping.url}">Telegraph</a>]`;
+            }
+            line += '\n';
+            if (msg.length + line.length > 4000) {
+                msgs.push(msg);
+                msg = line;
+            } else {
+                msg += line;
+            }
+        }
+        if (msg) {
+            msgs.push(msg);
+        }
+        
+        for (const m of msgs) {
+            await ctx.reply(m, { parse_mode: 'HTML' });
+        }
+    } catch (e) {
+        ctx.reply((t('artifacts.error') || '❌ Error reading artifact: ') + e.message);
+    }
+};
+
+bot.command('artifacts', handleArtifacts);
+bot.hears(/^📦/i, handleArtifacts);
+
+bot.hears(/^\/artifact_(\d+)$/, async (ctx) => {
+    const num = parseInt(ctx.match[1], 10);
+    if (num > 0 && num <= cachedArtifacts.length) {
+        const artifact = cachedArtifacts[num - 1];
+        ctx.reply((t('artifacts.sending', { name: artifact.name }) || `📤 Sending artifact: <b>${artifact.name}</b>...`), { parse_mode: 'HTML' });
+        
+        const ext = path.extname(artifact.name).toLowerCase();
+        try {
+            if (ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.webp') {
+                await ctx.replyWithPhoto({ source: artifact.path });
+            } else if (ext === '.mp4' || ext === '.mov') {
+                await ctx.replyWithVideo({ source: artifact.path });
+            } else if (ext === '.md') {
+                const content = fs.readFileSync(artifact.path, 'utf8');
+                await sendBotMessage(ctx, content);
+            } else {
+                await ctx.replyWithDocument({ source: artifact.path });
+            }
+        } catch (e) {
+            ctx.reply((t('artifacts.error') || '❌ Error: ') + e.message);
+        }
+    } else {
+        ctx.reply(t('artifacts.invalid_number') || '❌ Invalid artifact number.');
+    }
+});
+
+function getAllInstalledSkills() {
+    const allSkills = [];
+    const seen = new Set();
+
+    function scanDir(dir, category = 'Custom') {
+        if (!dir || !fs.existsSync(dir)) return;
+        try {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (entry.isDirectory() && !entry.name.startsWith('.') && !entry.name.startsWith('_')) {
+                    if (seen.has(entry.name)) continue;
+                    seen.add(entry.name);
+                    const skillMd = path.join(dir, entry.name, 'SKILL.md');
+                    let desc = '';
+                    if (fs.existsSync(skillMd)) {
+                        try {
+                            const content = fs.readFileSync(skillMd, 'utf8');
+                            desc = extractSkillDescription(content);
+                        } catch(e) {}
+                    }
+                    allSkills.push({ name: entry.name, category, desc });
+                }
+            }
+        } catch(e) {}
+    }
+
+    const home = os.homedir();
+    // 1. Antigravity Global Custom Skills (~/.gemini/config/skills)
+    scanDir(path.join(home, '.gemini', 'config', 'skills'), '⚡ Custom Skills');
+    
+    // 2. Antigravity Built-in Skills (~/.gemini/antigravity/builtin/skills and ~/.gemini/antigravity/skills)
+    scanDir(path.join(home, '.gemini', 'antigravity', 'builtin', 'skills'), '🤖 Built-in Skills');
+    scanDir(path.join(home, '.gemini', 'antigravity', 'skills'), '🤖 Built-in Skills');
+    
+    // 3. Antigravity Plugins (~/.gemini/config/plugins/*/skills)
+    const pluginsDir = path.join(home, '.gemini', 'config', 'plugins');
+    if (fs.existsSync(pluginsDir)) {
+        try {
+            const plugins = fs.readdirSync(pluginsDir, { withFileTypes: true });
+            for (const p of plugins) {
+                if (p.isDirectory()) {
+                    scanDir(path.join(pluginsDir, p.name, 'skills'), `🔌 ${p.name}`);
+                }
+            }
+        } catch(e) {}
+    }
+
+    // 4. Claude Code / Compatible Agent Skills (~/.claude/skills)
+    scanDir(path.join(home, '.claude', 'skills'), '⚡ Claude Skills');
+
+    // 5. Active Workspace Skills (if workspace is known)
+    try {
+        const lastWs = getLastWorkspace();
+        if (lastWs && fs.existsSync(lastWs)) {
+            scanDir(path.join(lastWs, '.gemini', 'skills'), '📁 Workspace Skills');
+            scanDir(path.join(lastWs, '.agents', 'skills'), '📁 Workspace Skills');
+            scanDir(path.join(lastWs, '.claude', 'skills'), '📁 Workspace Skills');
+            scanDir(path.join(lastWs, 'skills'), '📁 Workspace Skills');
+        }
+    } catch(e) {}
+
+    return allSkills;
+}
+
+// ─── Interactive Skills Menu (modeled after /agents) ───
+
+const SKILLS_PAGE_SIZE = 8;
+
+function refreshSkillsCache() {
+    cachedSkillsList = getAllInstalledSkills();
+    cachedSkillCategories = {};
+    for (const skill of cachedSkillsList) {
+        if (!cachedSkillCategories[skill.category]) cachedSkillCategories[skill.category] = [];
+        cachedSkillCategories[skill.category].push(skill);
+    }
+    return cachedSkillsList;
+}
+
+function renderSkillsCategoryKeyboard() {
+    const inline_keyboard = [];
+    const categories = Object.entries(cachedSkillCategories);
+    
+    let currentRow = [];
+    for (const [catName, skills] of categories) {
+        const label = `${catName} (${skills.length})`;
+        const catIdx = categories.findIndex(([n]) => n === catName);
+        currentRow.push({ text: label, callback_data: `sk_cat:${catIdx}:0` });
+        if (currentRow.length === 2) {
+            inline_keyboard.push(currentRow);
+            currentRow = [];
+        }
+    }
+    if (currentRow.length > 0) inline_keyboard.push(currentRow);
+
+    inline_keyboard.push([
+        { text: t('skills.refresh_btn') || '🔄 Refresh', callback_data: 'sk_refresh' },
+        { text: t('skills.close_btn') || '❌ Close', callback_data: 'sk_close' }
+    ]);
+
+    const text = t('skills.menu_title', { count: cachedSkillsList.length }) ||
+        `🧠 <b>Agent Skills (${cachedSkillsList.length})</b>\n\n` +
+        `📂 <i>Browse by category or search:</i>\n` +
+        `💡 <code>/skill &lt;name&gt; [prompt]</code>`;
+
+    return { text, reply_markup: { inline_keyboard } };
+}
+
+function renderSkillsListKeyboard(catIdx, page = 0) {
+    const categories = Object.entries(cachedSkillCategories);
+    if (catIdx < 0 || catIdx >= categories.length) return null;
+    
+    const [catName, skills] = categories[catIdx];
+    const totalPages = Math.ceil(skills.length / SKILLS_PAGE_SIZE);
+    const pageSkills = skills.slice(page * SKILLS_PAGE_SIZE, (page + 1) * SKILLS_PAGE_SIZE);
+    
+    const inline_keyboard = [];
+    for (const skill of pageSkills) {
+        const globalIdx = cachedSkillsList.indexOf(skill);
+        let displayName = skill.name.length > 30 ? skill.name.substring(0, 28) + '…' : skill.name;
+        inline_keyboard.push([{ text: `🧠 ${displayName}`, callback_data: `sk_view:${globalIdx}` }]);
+    }
+
+    // Pagination row
+    if (totalPages > 1) {
+        const paginationRow = [];
+        if (page > 0) paginationRow.push({ text: '◀️', callback_data: `sk_cat:${catIdx}:${page - 1}` });
+        paginationRow.push({ text: `${page + 1}/${totalPages}`, callback_data: 'sk_noop' });
+        if (page < totalPages - 1) paginationRow.push({ text: '▶️', callback_data: `sk_cat:${catIdx}:${page + 1}` });
+        inline_keyboard.push(paginationRow);
+    }
+
+    inline_keyboard.push([
+        { text: t('skills.back_btn') || '⬅️ All Categories', callback_data: 'sk_back' },
+        { text: t('skills.close_btn') || '❌ Close', callback_data: 'sk_close' }
+    ]);
+
+    const text = t('skills.category_title', { category: catName, count: skills.length }) ||
+        `${catName}\n<b>${skills.length} skills</b>\n\n<i>Tap a skill for details:</i>`;
+
+    return { text, reply_markup: { inline_keyboard } };
+}
+
+function renderSkillDetailKeyboard(skillIdx) {
+    if (skillIdx < 0 || skillIdx >= cachedSkillsList.length) return null;
+    
+    const skill = cachedSkillsList[skillIdx];
+    const catIdx = Object.entries(cachedSkillCategories).findIndex(([n]) => n === skill.category);
+    
+    let text = `🧠 <b>${escapeHtml(skill.name)}</b>\n`;
+    text += `📦 <i>${escapeHtml(skill.category)}</i>\n\n`;
+    
+    if (skill.desc) {
+        const cleanDesc = skill.desc.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const shortDesc = cleanDesc.length > 300 ? cleanDesc.substring(0, 297) + '...' : cleanDesc;
+        text += `${shortDesc}\n\n`;
+    } else {
+        text += `<i>No description available.</i>\n\n`;
+    }
+    text += `💡 <code>/skill ${skill.name} &lt;prompt&gt;</code>`;
+
+    const inline_keyboard = [
+        [{ text: '▶️ Run this skill', callback_data: `sk_run:${skillIdx}` }],
+        [
+            { text: t('skills.back_btn') || '⬅️ Back', callback_data: catIdx >= 0 ? `sk_cat:${catIdx}:0` : 'sk_back' },
+            { text: t('skills.close_btn') || '❌ Close', callback_data: 'sk_close' }
+        ]
+    ];
+
+    return { text, reply_markup: { inline_keyboard } };
+}
+
+function renderSearchResultsKeyboard(query, results) {
+    const inline_keyboard = [];
+    const topResults = results.slice(0, 10);
+    for (const skill of topResults) {
+        const globalIdx = cachedSkillsList.indexOf(skill);
+        let displayName = skill.name.length > 28 ? skill.name.substring(0, 26) + '…' : skill.name;
+        inline_keyboard.push([{ text: `🧠 ${displayName}`, callback_data: `sk_view:${globalIdx}` }]);
+    }
+    inline_keyboard.push([{ text: t('skills.close_btn') || '❌ Close', callback_data: 'sk_close' }]);
+
+    let text = t('skills.search_results', { query: escapeHtml(query), count: results.length }) ||
+        `🔍 <b>Results for "${escapeHtml(query)}" (${results.length})</b>`;
+    if (results.length > 10) text += `\n<i>Showing top 10 of ${results.length} matches.</i>`;
+
+    return { text, reply_markup: { inline_keyboard } };
+}
+
+bot.command('skills', async (ctx) => {
+    try {
+        const rawText = ctx.message?.text?.trim() || '';
+        const query = rawText.replace(/^\/skills(?:@[\w_]+)?\s*/i, '').trim().toLowerCase();
+        
+        refreshSkillsCache();
+
+        if (cachedSkillsList.length === 0) {
+            return ctx.reply(t('skills.no_skills') || 'ℹ️ No skills installed.');
+        }
+
+        // If query → search
+        if (query) {
+            const results = cachedSkillsList.filter(s =>
+                s.name.toLowerCase().includes(query) ||
+                (s.desc && s.desc.toLowerCase().includes(query))
+            );
+            if (results.length === 0) {
+                return ctx.reply(t('skills.not_found', { name: escapeHtml(query) }) || `❌ No skills found matching "${escapeHtml(query)}".`);
+            }
+            if (results.length === 1) {
+                const idx = cachedSkillsList.indexOf(results[0]);
+                const view = renderSkillDetailKeyboard(idx);
+                return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+            }
+            const view = renderSearchResultsKeyboard(query, results);
+            return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+        }
+
+        // No query → category menu
+        const view = renderSkillsCategoryKeyboard();
+        await ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+    } catch (e) {
+        ctx.reply('❌ Error: ' + e.message);
+    }
+});
+
+// Category view (with pagination)
+bot.action(/^sk_cat:(\d+):(\d+)$/, async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const catIdx = parseInt(ctx.match[1], 10);
+        const page = parseInt(ctx.match[2], 10);
+        if (cachedSkillsList.length === 0) refreshSkillsCache();
+        const view = renderSkillsListKeyboard(catIdx, page);
+        if (view) {
+            await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+        }
+    } catch (e) {
+        console.debug('[sk_cat] edit failed:', e.message);
+    }
+});
+
+// Skill detail view
+bot.action(/^sk_view:(\d+)$/, async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const idx = parseInt(ctx.match[1], 10);
+        if (cachedSkillsList.length === 0) refreshSkillsCache();
+        const view = renderSkillDetailKeyboard(idx);
+        if (view) {
+            await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+        }
+    } catch (e) {
+        console.debug('[sk_view] edit failed:', e.message);
+    }
+});
+
+// Run skill from detail view
+bot.action(/^sk_run:(\d+)$/, async (ctx) => {
+    try {
+        const idx = parseInt(ctx.match[1], 10);
+        if (cachedSkillsList.length === 0) refreshSkillsCache();
+        if (idx >= 0 && idx < cachedSkillsList.length) {
+            const skill = cachedSkillsList[idx];
+            await ctx.answerCbQuery(t('skills.running', { name: skill.name }) || `▶️ Running ${skill.name}...`);
+            try { await ctx.deleteMessage(); } catch (_) {
+                try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (__) {}
+            }
+            // Send as message to agent
+            const prompt = `Use the ${skill.name} skill.`;
+            try {
+                setReaction(ctx, REACTION.THINKING).catch(()=>{});
+                await sendViaCDPWithRecovery(prompt);
+            } catch (err) {
+                ctx.reply(t('ask.headless_error', { error: err.message }) || err.message).catch(() => {});
+            }
+        }
+    } catch (e) {
+        console.debug('[sk_run] failed:', e.message);
+    }
+});
+
+// Back to categories
+bot.action('sk_back', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        if (cachedSkillsList.length === 0) refreshSkillsCache();
+        const view = renderSkillsCategoryKeyboard();
+        await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+    } catch (e) {
+        console.debug('[sk_back] edit failed:', e.message);
+    }
+});
+
+// Refresh
+bot.action('sk_refresh', async (ctx) => {
+    try {
+        await ctx.answerCbQuery(t('skills.refresh_btn') || '🔄 Refreshing...');
+        refreshSkillsCache();
+        const view = renderSkillsCategoryKeyboard();
+        await ctx.editMessageText(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+    } catch (e) {
+        console.debug('[sk_refresh] failed:', e.message);
+    }
+});
+
+// Close
+bot.action('sk_close', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        await ctx.deleteMessage().catch(() => {
+            ctx.editMessageText('❌', { reply_markup: { inline_keyboard: [] } }).catch(() => {});
+        });
+    } catch (_) {}
+});
+
+// No-op for pagination label
+bot.action('sk_noop', async (ctx) => {
+    try { await ctx.answerCbQuery(); } catch (_) {}
+});
+
+// /skill <name> [prompt] — direct skill invocation
+bot.command('skill', async (ctx) => {
+    try {
+        const rawText = ctx.message?.text?.trim() || '';
+        const args = rawText.replace(/^\/skill(?:@[\w_]+)?\s*/i, '').trim();
+        
+        if (!args) {
+            // No args → show skills menu
+            refreshSkillsCache();
+            if (cachedSkillsList.length === 0) {
+                return ctx.reply(t('skills.no_skills') || 'ℹ️ No skills installed.');
+            }
+            const view = renderSkillsCategoryKeyboard();
+            return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+        }
+
+        const parts = args.split(/\s+/);
+        const skillName = parts[0].toLowerCase().replace(/^\//, '');
+        const prompt = parts.slice(1).join(' ');
+
+        if (cachedSkillsList.length === 0) refreshSkillsCache();
+        
+        const skill = cachedSkillsList.find(s => s.name.toLowerCase() === skillName);
+        if (!skill) {
+            // Fuzzy search
+            const matches = cachedSkillsList.filter(s => s.name.toLowerCase().includes(skillName));
+            if (matches.length === 1) {
+                const msg = prompt
+                    ? `Use the ${matches[0].name} skill: ${prompt}`
+                    : `Use the ${matches[0].name} skill.`;
+                try {
+                    setReaction(ctx, REACTION.THINKING).catch(()=>{});
+                    await sendViaCDPWithRecovery(msg);
+                } catch (err) {
+                    ctx.reply(t('ask.headless_error', { error: err.message }) || err.message).catch(() => {});
+                }
+                return;
+            }
+            if (matches.length > 1) {
+                const view = renderSearchResultsKeyboard(skillName, matches);
+                return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+            }
+            return ctx.reply(t('skills.not_found', { name: escapeHtml(skillName) }) || `❌ No skill found: "${escapeHtml(skillName)}"`);
+        }
+
+        if (!prompt) {
+            // No prompt → show detail
+            const idx = cachedSkillsList.indexOf(skill);
+            const view = renderSkillDetailKeyboard(idx);
+            return ctx.reply(view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+        }
+
+        // Run skill with prompt
+        const msg = `Use the ${skill.name} skill: ${prompt}`;
+        try {
+            setReaction(ctx, REACTION.THINKING).catch(()=>{});
+            await sendViaCDPWithRecovery(msg);
+        } catch (err) {
+            ctx.reply(t('ask.headless_error', { error: err.message }) || err.message).catch(() => {});
+        }
+    } catch (e) {
+        ctx.reply('❌ Error: ' + e.message);
+    }
+});
+
+let cachedModelsList = [];
+
+async function ensureModelsCache() {
+    if (!cachedModelsList || cachedModelsList.length === 0) {
+        try {
+            cachedModelsList = await getAvailableModels(CDP_PORT);
+        } catch (e) {
+            console.error('Failed to get dynamic models:', e.message);
+        }
+        if (!cachedModelsList || cachedModelsList.length === 0) {
+            cachedModelsList = [
+                { name: 'Gemini 3.7 Flash', baseName: 'Gemini 3.7 Flash', hasTiers: true, tiers: ['Low', 'Medium', 'High'], currentTier: 'Medium' },
+                { name: 'Gemini 3.6 Flash', baseName: 'Gemini 3.6 Flash', hasTiers: true, tiers: ['Low', 'Medium', 'High'], currentTier: 'Medium' },
+                { name: 'Gemini 3.5 Flash', baseName: 'Gemini 3.5 Flash', hasTiers: true, tiers: ['Low', 'Medium', 'High'], currentTier: 'Medium' },
+                { name: 'Gemini 3.1 Pro', baseName: 'Gemini 3.1 Pro', hasTiers: true, tiers: ['Low', 'High'], currentTier: 'Low' },
+                { name: 'Claude Sonnet 4.6 (Thinking)', baseName: 'Claude Sonnet 4.6 (Thinking)', hasTiers: false, tiers: [] },
+                { name: 'Claude Opus 4.6 (Thinking)', baseName: 'Claude Opus 4.6 (Thinking)', hasTiers: false, tiers: [] },
+                { name: 'GPT-OSS 120B (Medium)', baseName: 'GPT-OSS 120B (Medium)', hasTiers: false, tiers: [] }
+            ];
+        }
+    }
+    return cachedModelsList;
+}
+
+function buildModelListButtons(models) {
+    return models.map((m, idx) => {
+        const isObj = typeof m === 'object';
+        const name = isObj ? m.name : m;
+        const hasTiers = isObj ? m.hasTiers : false;
+        
+        const label = `🤖 ${name}`;
+        
+        if (hasTiers) {
+            return [{ text: label, callback_data: `md_tier_${idx}` }];
+        } else {
+            return [{ text: label, callback_data: `md_direct_${idx}` }];
+        }
+    });
+}
+
+const handleModel = async (ctx) => {
+    let modelName = '';
+    if (ctx.message && ctx.message.text) {
+        const parts = ctx.message.text.split(' ');
+        if (parts[0].startsWith('/')) parts.shift();
+        modelName = parts.join(' ').trim();
+        // Clear if it's from the button text
+        if (modelName.startsWith('🧠') || modelName.startsWith('🤖') || modelName.toLowerCase().startsWith('model:')) modelName = '';
+    }
+    if (modelName) {
+        try {
+            setReaction(ctx, REACTION.THINKING);
+            const success = await selectModel(CDP_PORT, modelName);
+            if (success) ctx.reply(t('model.changed', { model: modelName }));
+            else ctx.reply(t('model.not_found'));
+        } catch(e) {
+            ctx.reply(t('stop.error', { error: e.message }));
+        }
+        return;
+    }
+    
+    // Refresh models dynamically
+    try {
+        cachedModelsList = await getAvailableModels(CDP_PORT);
+    } catch (_) {}
+    const models = await ensureModelsCache();
+    const buttons = buildModelListButtons(models);
+    
+    ctx.reply(t('model.select_prompt'), {
+        reply_markup: { inline_keyboard: buttons }
+    });
+};
+bot.command('model', handleModel);
+
+// 1. Base model clicked -> show tier selection sub-menu
+bot.action(/md_tier_(\d+)/, async (ctx) => {
+    try {
+        const idx = parseInt(ctx.match[1], 10);
+        const models = await ensureModelsCache();
+        const modelObj = models[idx];
+        if (!modelObj) {
+            return ctx.answerCbQuery(t('model.not_found') || 'Model not found');
+        }
+
+        const cleanName = (modelObj.name || modelObj.baseName || '')
+            .replace(/\s*\(?\b(low|medium|high)\b\)?\s*/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        ctx.answerCbQuery(cleanName);
+
+        const tierButtons = [];
+        const tiersRow = (modelObj.tiers || ['Low', 'Medium', 'High']).map(tier => {
+            const tierEmoji = tier.toLowerCase() === 'high' ? '🔴' : (tier.toLowerCase() === 'medium' ? '🟡' : '🟢');
+            return { text: `${tierEmoji} ${tier}`, callback_data: `md_sel_${idx}_${tier}` };
+        });
+        tierButtons.push(tiersRow);
+        tierButtons.push([{ text: '🔙 Model Listesi', callback_data: 'md_back' }]);
+
+        const text = `🤖 <b>${escapeHtml(cleanName)}</b> için düşünme seviyesini (effort tier) seçin:`;
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: tierButtons }
+            }).catch(() => {});
+        } else {
+            await ctx.reply(text, {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: tierButtons }
+            });
+        }
+    } catch(e) {
+        ctx.answerCbQuery(t('model.error'));
+    }
+});
+
+// 2. Back button clicked -> return to main model list
+bot.action('md_back', async (ctx) => {
+    try {
+        ctx.answerCbQuery();
+        const models = await ensureModelsCache();
+        const buttons = buildModelListButtons(models);
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            await ctx.editMessageText(t('model.select_prompt'), {
+                reply_markup: { inline_keyboard: buttons }
+            }).catch(() => {});
+        }
+    } catch(e) {
+        ctx.answerCbQuery();
+    }
+});
+
+// 3. Concrete model with tier selected: md_sel_<idx>_<tier>
+bot.action(/md_sel_(\d+)_(.+)/, async (ctx) => {
+    try {
+        const idx = parseInt(ctx.match[1], 10);
+        const tier = ctx.match[2];
+        const models = await ensureModelsCache();
+        const modelObj = models[idx];
+        
+        const cleanBase = (modelObj ? (modelObj.baseName || modelObj.name) : '')
+            .replace(/\s*\(?\b(low|medium|high)\b\)?\s*/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const fullModelName = cleanBase ? `${cleanBase} (${tier})` : `${tier}`;
+        ctx.answerCbQuery(fullModelName);
+        
+        const changingText = t('model.changing', { model: fullModelName });
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            await ctx.editMessageText(changingText).catch(()=>{});
+        } else {
+            await ctx.reply(changingText);
+        }
+        
+        const isHeadless = await shouldUseHeadless(CDP_PORT);
+        if (isHeadless) {
+            setAgyModel(fullModelName);
+            return ctx.reply(t('model.changed', { model: fullModelName }));
+        }
+        
+        const success = await selectModel(CDP_PORT, fullModelName);
+        if (success) {
+            await sendMainMenu(ctx, t('model.changed', { model: fullModelName }));
+        } else {
+            ctx.reply(t('model.select_failed'));
+        }
+    } catch(e) {
+        ctx.answerCbQuery(t('model.error'));
+    }
+});
+
+// 4. Direct model selected without tiers: md_direct_<idx>
+bot.action(/md_direct_(\d+)/, async (ctx) => {
+    try {
+        const idx = parseInt(ctx.match[1], 10);
+        const models = await ensureModelsCache();
+        const modelObj = models[idx];
+        const modelName = modelObj ? modelObj.name : 'Unknown';
+        
+        ctx.answerCbQuery(modelName);
+        const changingText = t('model.changing', { model: modelName });
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            await ctx.editMessageText(changingText).catch(()=>{});
+        } else {
+            await ctx.reply(changingText);
+        }
+        
+        const isHeadless = await shouldUseHeadless(CDP_PORT);
+        if (isHeadless) {
+            setAgyModel(modelName);
+            return ctx.reply(t('model.changed', { model: modelName }));
+        }
+
+        const success = await selectModel(CDP_PORT, modelName);
+        if (success) {
+            await sendMainMenu(ctx, t('model.changed', { model: modelName }));
+        } else {
+            ctx.reply(t('model.select_failed'));
+        }
+    } catch(e) {
+        ctx.answerCbQuery(t('model.error'));
+    }
+});
+
+// Fallback / legacy base64 callback
+bot.action(/md_(.+)/, async (ctx) => {
+    if (ctx.match[1].startsWith('tier_') || ctx.match[1].startsWith('sel_') || ctx.match[1].startsWith('direct_') || ctx.match[1] === 'back') return;
+    try {
+        const modelName = Buffer.from(ctx.match[1], 'base64').toString('utf-8');
+        ctx.answerCbQuery(modelName);
+        const changingText = t('model.changing', { model: modelName });
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            await ctx.editMessageText(changingText).catch(()=>{});
+        } else {
+            await ctx.reply(changingText);
+        }
+        const success = await selectModel(CDP_PORT, modelName);
+        if (success) await sendMainMenu(ctx, t('model.changed', { model: modelName }));
+        else ctx.reply(t('model.select_failed'));
+    } catch(e) {
+        ctx.answerCbQuery(t('model.error'));
+    }
+});
+
+// ===== AUTO-ACCEPT =====
+
+const handleAutoAccept = async (ctx) => {
+    const text = ctx.message.text || '';
+    const parts = text.split(' ');
+    parts.shift();
+    const subCommand = parts.join(' ').trim().toLowerCase();
+
+    try {
+        if (subCommand === 'on' || (subCommand === '' && !autoaccept.isEnabled)) {
+            // Enable auto-accept
+            ctx.reply(t('autoaccept.enabling'));
+            const result = await autoaccept.enable(CDP_PORT);
+            let responseText = '';
+            if (result.injected > 0) {
+                responseText = t('autoaccept.enabled', { injected: result.injected });
+            } else {
+                responseText = t('autoaccept.enabled_none');
+            }
+            // If toggled via button click, refresh menu
+            if (subCommand === '') await sendMainMenu(ctx, responseText);
+            else ctx.reply(responseText);
+        } else if (subCommand === 'off' || (subCommand === '' && autoaccept.isEnabled)) {
+            // Disable auto-accept
+            ctx.reply(t('autoaccept.disabling'));
+            const result = await autoaccept.disable(CDP_PORT);
+            const responseText = t('autoaccept.disabled', { clicks: result.totalClicks });
+            // If toggled via button click, refresh menu
+            if (subCommand === '') await sendMainMenu(ctx, responseText);
+            else ctx.reply(responseText);
+        } else if (subCommand === 'status') {
+            // Show status
+            const status = await autoaccept.getStatus(CDP_PORT);
+            let msg = t('autoaccept.status_title');
+            msg += (status.enabled ? t('autoaccept.status_enabled') : t('autoaccept.status_disabled')) + '\n';
+
+            // Observer status
+            if (status.active) {
+                msg += t('autoaccept.status_active', { targets: status.injectedTargets }) + '\n';
+            } else {
+                msg += t('autoaccept.status_inactive') + '\n';
+            }
+
+            // Click stats
+            msg += t('autoaccept.status_clicks', { total: status.totalClicks, session: status.sessionClicks }) + '\n';
+
+            // Last click info
+            if (status.lastClickText && status.lastClickTimeSec !== null) {
+                msg += t('autoaccept.status_last_click', { text: status.lastClickText, sec: status.lastClickTimeSec }) + '\n';
+            }
+
+            // Blocked commands
+            msg += t('autoaccept.status_blocked', { count: status.blockedCommandsCount }) + '\n';
+
+            // Agent panel warning
+            if (!status.hasAgentPanel) {
+                msg += '\n' + t('autoaccept.status_no_panel');
+            }
+
+            ctx.reply(msg, { parse_mode: 'HTML' });
+        } else {
+            // Unknown subcommand — show inline buttons
+            const buttons = [
+                [{ text: '⚡ ' + (autoaccept.isEnabled ? t('menu.btn_off') : t('menu.btn_on')), callback_data: autoaccept.isEnabled ? 'aa_off' : 'aa_on' }],
+                [{ text: t('menu.btn_status'), callback_data: 'aa_status' }]
+            ];
+            ctx.reply(t('autoaccept.status_title') + (autoaccept.isEnabled ? t('autoaccept.status_enabled') : t('autoaccept.status_disabled')), {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: buttons }
+            });
+        }
+    } catch (e) {
+        ctx.reply(t('autoaccept.error', { error: e.message }));
+    }
+};
+
+bot.command('autoaccept', handleAutoAccept);
+bot.hears(/^(⚡|🔴)/i, handleAutoAccept);
+
+bot.action('aa_on', async (ctx) => {
+    try {
+        ctx.answerCbQuery('Enabling...');
+        const result = await autoaccept.enable(CDP_PORT);
+        if (result.injected > 0) {
+        }
+        
+        // Refresh the keyboard menu to update the button icon
+        await sendMainMenu(ctx, t('autoaccept.enabled', { injected: result.injected }));
+    } catch (e) {
+        ctx.reply(t('autoaccept.error', { error: e.message }));
+    }
+});
+
+bot.action('aa_off', async (ctx) => {
+    try {
+        ctx.answerCbQuery('Disabling...');
+        const result = await autoaccept.disable(CDP_PORT);
+        
+        // Refresh the keyboard menu to update the button icon
+        await sendMainMenu(ctx, t('autoaccept.disabled', { clicks: result.totalClicks }));
+    } catch (e) {
+        ctx.reply(t('autoaccept.error', { error: e.message }));
+    }
+});
+
+bot.action('aa_status', async (ctx) => {
+    try {
+        ctx.answerCbQuery('Loading...');
+        const status = await autoaccept.getStatus(CDP_PORT);
+        let msg = t('autoaccept.status_title');
+        msg += (status.enabled ? t('autoaccept.status_enabled') : t('autoaccept.status_disabled')) + '\n';
+        if (status.active) msg += t('autoaccept.status_active', { targets: status.injectedTargets }) + '\n';
+        else msg += t('autoaccept.status_inactive') + '\n';
+        msg += t('autoaccept.status_clicks', { total: status.totalClicks, session: status.sessionClicks }) + '\n';
+        if (status.lastClickText && status.lastClickTimeSec !== null) {
+            msg += t('autoaccept.status_last_click', { text: status.lastClickText, sec: status.lastClickTimeSec }) + '\n';
+        }
+        
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            const kb = ctx.callbackQuery.message.reply_markup;
+            ctx.editMessageText(msg, { parse_mode: 'HTML', reply_markup: kb }).catch(e => {
+                if (!e.message.includes('message is not modified')) ctx.reply(msg, { parse_mode: 'HTML' });
+            });
+        } else {
+            ctx.reply(msg, { parse_mode: 'HTML' });
+        }
+    } catch (e) {
+        ctx.reply(t('autoaccept.error', { error: e.message }));
+    }
+});
+
+// ===== TASK WATCHER =====
+
+const handleWatcher = async (ctx) => {
+    try {
+        if (!global.__taskWatcher) {
+            return ctx.reply('Task Watcher is not initialized.');
+        }
+        const text = (ctx.message?.text || '').trim();
+        const parts = text.split(/\s+/);
+        const subCommand = (parts[1] || '').toLowerCase();
+
+        if (subCommand === 'on') {
+            global.__taskWatcher.toggle(true);
+            ctx.reply(t('watcher.enabled'), { parse_mode: 'HTML' });
+        } else if (subCommand === 'off') {
+            global.__taskWatcher.toggle(false);
+            ctx.reply(t('watcher.disabled'), { parse_mode: 'HTML' });
+        } else {
+            const status = global.__taskWatcher.getStatus();
+            const stateStr = status.enabled ? t('watcher.state_on') : t('watcher.state_off');
+            const threadStr = status.activeConversationId ? status.activeConversationId.substring(0, 8) + '…' : 'None';
+            const msg = t('watcher.status', {
+                state: stateStr,
+                thread: threadStr,
+                count: status.watchingCount
+            });
+            const buttons = [
+                [
+                    { text: status.enabled ? t('menu.btn_off') : t('menu.btn_on'), callback_data: status.enabled ? 'tw_off' : 'tw_on' },
+                    { text: '🔄 ' + (t('menu.btn_status') || 'Status'), callback_data: 'tw_status' }
+                ]
+            ];
+            ctx.reply(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+        }
+    } catch (e) {
+        ctx.reply('❌ Error: ' + e.message);
+    }
+};
+
+bot.command('watcher', handleWatcher);
+
+bot.action('tw_on', async (ctx) => {
+    try {
+        if (global.__taskWatcher) global.__taskWatcher.toggle(true);
+        await ctx.answerCbQuery(t('watcher.state_on'));
+        const status = global.__taskWatcher.getStatus();
+        const stateStr = status.enabled ? t('watcher.state_on') : t('watcher.state_off');
+        const threadStr = status.activeConversationId ? status.activeConversationId.substring(0, 8) + '…' : 'None';
+        const msg = t('watcher.status', { state: stateStr, thread: threadStr, count: status.watchingCount });
+        const buttons = [
+            [
+                { text: status.enabled ? t('menu.btn_off') : t('menu.btn_on'), callback_data: status.enabled ? 'tw_off' : 'tw_on' },
+                { text: '🔄 ' + (t('menu.btn_status') || 'Status'), callback_data: 'tw_status' }
+            ]
+        ];
+        await ctx.editMessageText(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+    } catch (e) {}
+});
+
+bot.action('tw_off', async (ctx) => {
+    try {
+        if (global.__taskWatcher) global.__taskWatcher.toggle(false);
+        await ctx.answerCbQuery(t('watcher.state_off'));
+        const status = global.__taskWatcher.getStatus();
+        const stateStr = status.enabled ? t('watcher.state_on') : t('watcher.state_off');
+        const threadStr = status.activeConversationId ? status.activeConversationId.substring(0, 8) + '…' : 'None';
+        const msg = t('watcher.status', { state: stateStr, thread: threadStr, count: status.watchingCount });
+        const buttons = [
+            [
+                { text: status.enabled ? t('menu.btn_off') : t('menu.btn_on'), callback_data: status.enabled ? 'tw_off' : 'tw_on' },
+                { text: '🔄 ' + (t('menu.btn_status') || 'Status'), callback_data: 'tw_status' }
+            ]
+        ];
+        await ctx.editMessageText(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+    } catch (e) {}
+});
+
+bot.action('tw_status', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        if (!global.__taskWatcher) return;
+        const status = global.__taskWatcher.getStatus();
+        const stateStr = status.enabled ? t('watcher.state_on') : t('watcher.state_off');
+        const threadStr = status.activeConversationId ? status.activeConversationId.substring(0, 8) + '…' : 'None';
+        const msg = t('watcher.status', { state: stateStr, thread: threadStr, count: status.watchingCount });
+        const buttons = [
+            [
+                { text: status.enabled ? t('menu.btn_off') : t('menu.btn_on'), callback_data: status.enabled ? 'tw_off' : 'tw_on' },
+                { text: '🔄 ' + (t('menu.btn_status') || 'Status'), callback_data: 'tw_status' }
+            ]
+        ];
+        await ctx.editMessageText(msg, { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+    } catch (e) {}
+});
+
+// ===== WORKSPACE =====
+
+async function doLaunchWorkspace(ctx, workspace) {
+    try {
+        ensureMemoryConvention(workspace);
+    } catch (e) {
+        console.debug('[memory_convention] skipped:', e.message);
+    }
+
+    let switchingMsg;
+    if (ctx.callbackQuery && ctx.callbackQuery.message) {
+        try {
+            await ctx.editMessageText(t('workspace.switching', { workspace })).catch(()=>{});
+            switchingMsg = ctx.callbackQuery.message;
+        } catch(e) {}
+    } else {
+        try {
+            switchingMsg = await ctx.reply(t('workspace.switching', { workspace }));
+        } catch(e) {}
+    }
+
+    try {
+        const activeApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
+        const wsName = path.basename(workspace);
+        
+        // Standalone Agent 2.0 Hızlı Geçiş:
+        // Eğer 'agent' aktifse ve çalışıyorsa, sol menüdeki proje kartına tıklayarak 1 saniyede geçiş yapar!
+        if (activeApp === 'agent') {
+            const running = await isIDERunning('agent');
+            if (running) {
+                try {
+                    const success = await switchStandaloneWorkspace(CDP_PORT, wsName);
+                    if (success) {
+                        setActiveWorkspace(wsName);
+                        setPreferredWindow(null);
+                        if (autoaccept.isEnabled) {
+                            autoaccept.enable(CDP_PORT).catch(() => {});
+                        }
+                        await triggerNewChat(CDP_PORT);
+                        const successMsg = t('workspace.started', { workspace }) || '📁 Workspace switched successfully!';
+                        if (switchingMsg && switchingMsg.message_id) {
+                            ctx.deleteMessage(switchingMsg.message_id).catch(()=>{});
+                        }
+                        await sendMainMenu(ctx, successMsg);
+                        return;
+                    }
+                } catch (e) {
+                    console.debug('[doLaunchWorkspace] Standalone quick switch failed:', e.message);
+                }
+            } else {
+                try {
+                    await launchIDE(null, CDP_PORT, 'agent');
+                    await new Promise(r => setTimeout(r, 4000));
+                    const success = await switchStandaloneWorkspace(CDP_PORT, wsName);
+                    if (success) {
+                        setActiveWorkspace(wsName);
+                        setPreferredWindow(null);
+                        if (autoaccept.isEnabled) {
+                            autoaccept.enable(CDP_PORT).catch(() => {});
+                        }
+                        await triggerNewChat(CDP_PORT);
+                        const successMsg = t('workspace.started', { workspace }) || '📁 Workspace switched successfully!';
+                        if (switchingMsg && switchingMsg.message_id) {
+                            ctx.deleteMessage(switchingMsg.message_id).catch(()=>{});
+                        }
+                        await sendMainMenu(ctx, successMsg);
+                        return;
+                    }
+                } catch (e) {
+                    console.debug('[doLaunchWorkspace] Standalone launch and switch failed:', e.message);
+                }
+            }
+
+            // Fallback: Directly launch the Standalone App pointing to the workspace folder
+            try {
+                await launchIDE(workspace, CDP_PORT, 'agent');
+                setActiveWorkspace(wsName);
+                
+                // Poll CDP until the Standalone App window is responsive (max 30 seconds)
+                let cdpReady = false;
+                for (let i = 0; i < 15; i++) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    try {
+                        const http = require('http');
+                        const targets = await new Promise((resolve, reject) => {
+                            http.get(`http://127.0.0.1:${CDP_PORT}/json`, (res) => {
+                                let data = '';
+                                res.on('data', chunk => data += chunk);
+                                res.on('end', () => {
+                                    try { resolve(JSON.parse(data)); } catch(e) { reject(e); }
+                                });
+                            }).on('error', reject);
+                        });
+                        if (targets && targets.length > 0) {
+                            const targetWsName = wsName.toLowerCase();
+                            const foundNew = targets.some(t => t.title && t.title.toLowerCase().includes(targetWsName));
+                            if (foundNew) {
+                                cdpReady = true;
+                                break;
+                            }
+                        }
+                    } catch (_) {}
+                }
+                
+                if (cdpReady) {
+                    const successMsg = t('workspace.started', { workspace });
+                    if (switchingMsg && switchingMsg.message_id) {
+                        ctx.deleteMessage(switchingMsg.message_id).catch(()=>{});
+                    }
+                    setPreferredWindow(null);
+                    if (autoaccept.isEnabled) {
+                        autoaccept.enable(CDP_PORT).catch(() => {});
+                    }
+                    await triggerNewChat(CDP_PORT);
+                    await sendMainMenu(ctx, successMsg);
+                    return;
+                } else {
+                    const successMsg = (t('workspace.started', { workspace }) || '📁 Workspace switched successfully!') + (t('workspace.cdp_warning') || '\n⚠️ CDP not ready yet, but IDE was started.');
+                    if (switchingMsg && switchingMsg.message_id) {
+                        ctx.deleteMessage(switchingMsg.message_id).catch(()=>{});
+                    }
+                    setPreferredWindow(null);
+                    await sendMainMenu(ctx, successMsg);
+                    return;
+                }
+            } catch (fallbackErr) {
+                console.error('[doLaunchWorkspace] Standalone direct launch fallback failed:', fallbackErr);
+            }
+
+            await sendMainMenu(ctx, t('workspace.not_found_standalone', { wsName }));
+            return;
+        }
+        
+        // Multi-window support: DO NOT kill existing IDE instances!
+        // We just launch the new workspace.
+        
+        try {
+            await launchIDE(workspace, CDP_PORT);
+            if (workspace) {
+                setActiveWorkspace(path.basename(workspace));
+            }
+            // Poll CDP until the new IDE is responsive (max 30 seconds)
+            let cdpReady = false;
+            for (let i = 0; i < 15; i++) {
+                await new Promise(r => setTimeout(r, 2000));
+                try {
+                    const http = require('http');
+                    const targets = await new Promise((resolve, reject) => {
+                        http.get(`http://127.0.0.1:${CDP_PORT}/json`, (res) => {
+                            let data = '';
+                            res.on('data', chunk => data += chunk);
+                            res.on('end', () => {
+                                try { resolve(JSON.parse(data)); } catch(e) { reject(e); }
+                            });
+                        }).on('error', reject);
+                    });
+                    if (targets && targets.length > 0) {
+                        const targetWsName = workspace ? path.basename(workspace).toLowerCase() : null;
+                        const foundNew = targetWsName ? targets.some(t => t.title && t.title.toLowerCase().includes(targetWsName)) : true;
+                        if (foundNew) {
+                            cdpReady = true;
+                            break;
+                        }
+                    }
+                } catch (_) {
+                    // CDP not ready yet, keep waiting
+                }
+            }
+            if (cdpReady) {
+                const successMsg = t('workspace.started', { workspace });
+                if (switchingMsg && switchingMsg.message_id) {
+                    ctx.deleteMessage(switchingMsg.message_id).catch(()=>{});
+                }
+                await sendMainMenu(ctx, successMsg);
+                // trustWorkspaceViaCDP removed — CDP intervention during startup
+                // interrupts Electron's init/sync and prevents state.vscdb from saving
+                
+                // Clear preferred window when workspace changes
+                setPreferredWindow(null);
+                
+                // Re-inject autoaccept into the new window immediately
+                if (autoaccept.isEnabled) {
+                    autoaccept.enable(CDP_PORT).catch(() => {});
+                }
+            } else {
+                ctx.reply(t('workspace.started', { workspace }) + t('workspace.cdp_warning'));
+            }
+        } catch (err) {
+            console.error('doLaunchWorkspace error:', err);
+            ctx.reply(t('workspace.start_failed', { error: err.message }));
+        }
+    } catch (e) {
+        console.error('doLaunchWorkspace async wrap error:', e);
+    }
+}
+
+const handleWorkspace = (ctx) => {
+    let workspace = '';
+    if (ctx.message && ctx.message.text) {
+        let text = ctx.message.text.trim();
+        if (text.startsWith('🤖')) {
+            text = text.substring(2).trim();
+        }
+        const parts = text.split(' ');
+        if (parts[0].startsWith('/')) parts.shift();
+        workspace = parts.join(' ').trim();
+        if (workspace.toLowerCase().startsWith('workspace:')) {
+            workspace = workspace.substring(10).trim();
+        }
+    }
+    
+    let isValid = false;
+    let wsPath = '';
+    if (workspace) {
+        wsPath = workspace.startsWith('/') || workspace.includes(':') ? workspace : path.join(config.projectsDir, workspace);
+        try {
+            isValid = fs.statSync(wsPath).isDirectory();
+        } catch (e) {
+            isValid = false;
+        }
+    }
+    
+    if (!workspace || !isValid) {
+        const projectsDir = config.projectsDir;
+        fs.readdir(projectsDir, { withFileTypes: true }, (err, files) => {
+            if (err) return ctx.reply(t('workspace.read_error'));
+            const dirs = files.filter(f => f.isDirectory() && !f.name.startsWith('.')).map(f => f.name);
+            const buttons = dirs.map(d => [{ text: `📂 ${d}`, callback_data: `ws_${d}` }]);
+            
+            ctx.reply(t('workspace.select_prompt'), {
+                reply_markup: { inline_keyboard: buttons }
+            });
+        });
+        return;
+    }
+    
+    currentWorkspaceDir = wsPath;
+    doLaunchWorkspace(ctx, wsPath);
+};
+bot.command('workspace', handleWorkspace);
+
+bot.action(/ws_(.+)/, (ctx) => {
+    const project = ctx.match[1];
+    const wsPath = path.join(config.projectsDir, project);
+    currentWorkspaceDir = wsPath;
+    ctx.answerCbQuery(t('workspace.selected', { project }));
+    doLaunchWorkspace(ctx, wsPath);
+});
+
+// ===== PROJECT MEMORY =====
+bot.command('memory', async (ctx) => {
+    const { CANDIDATE_FILES } = require('./memory_convention');
+    const fs = require('fs');
+    const path = require('path');
+    
+    if (!currentWorkspaceDir || currentWorkspaceDir === config.projectsDir) {
+        return ctx.reply('Lütfen önce bir proje (workspace) seçin. Örnek: /workspace antigravity-bot');
+    }
+
+    const args = ctx.message.text.split(' ').slice(1);
+    const cmd = args[0] ? args[0].toLowerCase() : null;
+
+    if (cmd === 'off') {
+        process.env.AUTO_MEMORY_CONVENTION = 'false';
+        return ctx.reply('Project Memory özelliği bu oturum için geçici olarak kapatıldı.');
+    } else if (cmd === 'on') {
+        process.env.AUTO_MEMORY_CONVENTION = 'true';
+        return ctx.reply('Project Memory özelliği bu oturum için aktif edildi.');
+    }
+
+    const isActive = process.env.AUTO_MEMORY_CONVENTION === 'true';
+    let msg = `Project Memory Durumu:\n\n`;
+    msg += `Durum: ${isActive ? 'Aktif' : 'Kapalı'}\n`;
+    msg += `Aktif Proje: ${path.basename(currentWorkspaceDir)}\n\n`;
+
+    const existingFiles = [];
+    for (const name of CANDIDATE_FILES) {
+        const p = path.join(currentWorkspaceDir, name);
+        if (fs.existsSync(p)) {
+            existingFiles.push(name);
+        }
+    }
+
+    const buttons = [];
+    if (existingFiles.length > 0) {
+        msg += `Hafıza Dosyaları (Aşağıdan tıklayıp okuyabilirsin):`;
+        for (const f of existingFiles) {
+            const p = path.join(currentWorkspaceDir, f);
+            const pathId = getPathId(p);
+            buttons.push([{ text: `📄 ${f}`, callback_data: `ff_${pathId}` }]);
+        }
+    } else {
+        msg += `Projede AGENT.md veya GEMINI.md bulunamadı.`;
+    }
+
+    msg += `\n\nKapatmak için: /memory off\nAçmak için: /memory on`;
+    
+    if (buttons.length > 0) {
+        ctx.reply(msg, { reply_markup: { inline_keyboard: buttons } });
+    } else {
+        ctx.reply(msg);
+    }
+});
+
+// ===== LANGUAGE SWITCH =====
+
+bot.command('lang', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    const newLang = parts.join(' ').trim().toLowerCase();
+    
+    const availableLangs = fs.readdirSync(path.join(__dirname, '..', 'locales'))
+        .filter(f => f.endsWith('.json'))
+        .map(f => f.replace('.json', ''));
+
+    if (newLang && availableLangs.includes(newLang)) {
+        loadLocale(newLang);
+        saveLangState(newLang);
+        await clearAllMenuScopes();
+        await setMenuOnAllScopes();
+        await sendMainMenu(ctx, t('lang.changed', { lang: newLang }));
+        return;
+    }
+    
+    const langMap = {
+        'en': '🇬🇧 English',
+        'zh': '🇨🇳 中文',
+        'tr': '🇹🇷 Türkçe',
+        'es': '🇪🇸 Español',
+        'fr': '🇫🇷 Français',
+        'de': '🇩🇪 Deutsch',
+        'ko': '🇰🇷 한국어'
+    };
+    
+    const buttons = availableLangs.map(l => {
+        return [{ text: langMap[l] || l.toUpperCase(), callback_data: `lang_${l}` }];
+    });
+    
+    ctx.reply(t('lang.select_prompt'), {
+        reply_markup: { inline_keyboard: buttons }
+    });
+});
+
+bot.action(/lang_(.+)/, async (ctx) => {
+    const newLang = ctx.match[1];
+    loadLocale(newLang);
+    saveLangState(newLang);
+    await clearAllMenuScopes();
+    await setMenuOnAllScopes();
+    ctx.answerCbQuery(t('lang.changed', { lang: newLang }));
+    await sendMainMenu(ctx, t('lang.changed', { lang: newLang }));
+});
+
+
+// ===== DUAL APP SWITCHER =====
+
+bot.command('app', async (ctx) => {
+    const currentApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
+    const appName = currentApp === 'ide' ? '💻 Classic Monaco IDE' : '🤖 Standalone Agent (2.0)';
+    const currentPort = CDP_PORT;
+    
+    const agentPort = getCDPPort('agent');
+    const idePort = getCDPPort('ide');
+
+    let msg = t('app.selection_title') || `🤖 <b>Antigravity App Selection</b>\n\n`;
+    msg += t('app.preferred_app', { appName }) + '\n';
+    msg += t('app.active_port', { port: currentPort }) + '\n\n';
+    msg += t('app.select_prompt') + '\n';
+    msg += `• <b>Standalone Agent:</b> CDP Port ${agentPort}\n`;
+    msg += `• <b>Monaco IDE:</b> CDP Port ${idePort}\n\n`;
+    msg += t('app.persistent_selection') || `⚡ <i>Your selection is permanently saved to the .env file and applied instantly without restarting the bot.</i>`;
+
+    const buttons = [
+        [{ text: `🤖 Standalone Agent (Port: ${agentPort})`, callback_data: 'pref_app_agent' }],
+        [{ text: `💻 Classic Monaco IDE (Port: ${idePort})`, callback_data: 'pref_app_ide' }]
+    ];
+
+    ctx.reply(msg, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: buttons }
+    });
+});
+
+bot.action(/pref_app_(.+)/, async (ctx) => {
+    const selectedApp = ctx.match[1]; // 'agent' or 'ide'
+    const oldApp = selectedApp === 'ide' ? 'agent' : 'ide';
+    
+    const success = updateEnvFile('ANTIGRAVITY_PREFERRED_APP', selectedApp);
+    
+    if (success) {
+        // Eski uygulamayı güvenli bir şekilde kapat (UI'ı bloklamadan arka planda)
+        const killPromise = killIDE(oldApp).catch(e => console.error('[App Switch] Failed to kill old app:', e.message));
+        
+        // Recalculate port
+        CDP_PORT = getCDPPort();
+        ctx.answerCbQuery(t('app.updated_preference', { app: selectedApp }));
+        
+        const appName = selectedApp === 'ide' ? '💻 Classic Monaco IDE' : '🤖 Standalone Agent (2.0)';
+        let msg = t('app.updated_title');
+        msg += t('app.preferred_app', { appName });
+        msg += t('app.new_port', { port: CDP_PORT });
+        msg += t('app.redirect_info');
+        
+        ctx.reply(msg, { parse_mode: 'HTML' });
+        
+        // Seçilen uygulama açık değilse otomatik başlat
+        let autoStarted = false;
+        try {
+            const running = await isIDERunning(selectedApp);
+            if (!running) {
+                ctx.reply(t('app.auto_starting', { appName }));
+                await killPromise; // Race condition önlemi: Eski uygulamanın tamamen kapandığından emin ol
+                await launchIDE(null, CDP_PORT, selectedApp);
+                // Uygulamanın açılması için biraz bekle
+                await new Promise(r => setTimeout(r, 4000));
+                autoStarted = true;
+            }
+        } catch (err) {
+            console.error('[App Switch] Auto-start failed:', err.message);
+        }
+        
+        // Autoaccept status reload for new port
+        if (autoaccept.isEnabled) {
+            autoaccept.enable(CDP_PORT).catch(() => {});
+        }
+        
+        if (autoStarted) {
+            await sendMainMenu(ctx, t('app.started', { appName }));
+        } else {
+            await sendMainMenu(ctx, t('app.control_panel', { app: selectedApp === 'ide' ? 'IDE' : 'Agent' }));
+        }
+    } else {
+        ctx.answerCbQuery(t('app.error_save'));
+    }
+});
+
+// ===== SHORTCUTS FIXER =====
+
+bot.command('fix_shortcuts', async (ctx) => {
+    ctx.reply(t('shortcuts.scanning'));
+    
+    const platform = require('./platform').PLATFORM;
+    const { getAppBinary } = require('./platform');
+    const agentPort = getCDPPort('agent');
+    const idePort = getCDPPort('ide');
+    
+    if (platform === 'linux') {
+        // Linux: Update launcher scripts and .desktop files
+        try {
+            const localBin = path.join(os.homedir(), '.local', 'bin');
+            const desktop = path.join(os.homedir(), 'Desktop');
+            let fixedCount = 0;
+            let status = t('shortcuts.updated_header');
+
+            // Ensure directories exist
+            if (!fs.existsSync(localBin)) fs.mkdirSync(localBin, { recursive: true });
+
+            // --- 1. IDE Launcher ---
+            const ideBinary = getAppBinary('ide');
+            const ideLauncherPath = path.join(localBin, 'antigravity-ide-launcher.sh');
+            const ideDesktopPath = path.join(desktop, 'Antigravity-IDE-CDP.desktop');
+            
+            if (fs.existsSync(ideBinary) || fs.existsSync(require('fs').realpathSync(ideBinary).replace(/\/[^/]+$/, ''))) {
+                const ideLauncher = `#!/bin/bash\n# Antigravity IDE Launcher — Port ${idePort}\nPORT=${idePort}\nAPP_PATH="${ideBinary}"\n\n# Check if the IDE is already listening on the port\nLISTENING_PIDS=$(lsof -t -i :$PORT -s TCP:LISTEN 2>/dev/null || true)\n\nif [ -n "$LISTENING_PIDS" ]; then\n    echo "[launcher-ide] IDE already running. Opening a new window..."\n    $APP_PATH "$@"\n    exit 0\nfi\n\necho "[launcher-ide] Starting fresh IDE instance..."\n# Clean up stale locks just in case\nrm -f "$HOME/.config/Antigravity IDE/code.lock"\nrm -f "$HOME/.config/Antigravity-IDE/code.lock"\n\n$APP_PATH --remote-debugging-port=$PORT "$@" &\\nAG_PID=$!\\nwait $AG_PID\\n`;
+                fs.writeFileSync(ideLauncherPath, ideLauncher, { mode: 0o755 });
+
+                const ideDesktop = `[Desktop Entry]\nName=Antigravity IDE (CDP ${idePort})\nComment=Start Antigravity IDE with CDP ${idePort}\nExec=${ideLauncherPath} %F\nIcon=antigravity-ide\nType=Application\nTerminal=false\nStartupNotify=false\nStartupWMClass=antigravity-ide\nCategories=Development;IDE;\nMimeType=application/x-antigravity-workspace;\n`;
+                fs.writeFileSync(ideDesktopPath, ideDesktop);
+                exec(`chmod +x "${ideDesktopPath}"`);
+                status += `• 💻 <b>Antigravity IDE</b> -> <code>--remote-debugging-port=${idePort}</code> ✅\n`;
+                fixedCount++;
+            } else {
+                status += `• 💻 <i>Antigravity IDE</i> (${t('shortcuts.binary_not_found')})\n`;
+            }
+
+            // --- 2. Standalone Agent ---
+            const agentBinary = getAppBinary('agent');
+            const agentLauncherPath = path.join(localBin, 'antigravity-standalone-launcher.sh');
+            const agentDesktopPath = path.join(desktop, 'Antigravity-Standalone-CDP.desktop');
+            
+            if (fs.existsSync(agentBinary)) {
+                const agentLauncher = `#!/bin/bash\n# Antigravity Standalone Launcher — Port ${agentPort}\nPORT=${agentPort}\nAPP_PATH="${agentBinary}"\n\n# Check if the Standalone App is already listening on the port\nLISTENING_PIDS=$(lsof -t -i :$PORT -s TCP:LISTEN 2>/dev/null || true)\n\nif [ -n "$LISTENING_PIDS" ]; then\n    echo "[launcher-standalone] Standalone App already running. Opening a new window..."\n    $APP_PATH "$@"\n    exit 0\nfi\n\necho "[launcher-standalone] Starting fresh Standalone App instance..."\n# Clean up stale locks just in case\nrm -f "$HOME/.config/Antigravity/code.lock"\n\n$APP_PATH --remote-debugging-port=$PORT "$@" &\\nAG_PID=$!\\nwait $AG_PID\\n`;
+                fs.writeFileSync(agentLauncherPath, agentLauncher, { mode: 0o755 });
+
+                const agentDesktop = `[Desktop Entry]\nName=Antigravity Standalone (CDP ${agentPort})\nComment=Start Antigravity Standalone Agent with CDP ${agentPort}\nExec=${agentLauncherPath} %F\nIcon=antigravity-standalone\nType=Application\nTerminal=false\nStartupNotify=false\nStartupWMClass=antigravity\nCategories=Development;IDE;\nMimeType=application/x-antigravity-workspace;\n`;
+                fs.writeFileSync(agentDesktopPath, agentDesktop);
+                exec(`chmod +x "${agentDesktopPath}"`);
+                status += `• 🤖 <b>Antigravity Standalone</b> -> <code>--remote-debugging-port=${agentPort}</code> ✅\n`;
+                fixedCount++;
+            } else {
+                status += `• 🤖 <i>Antigravity Standalone</i> (${t('shortcuts.binary_not_found')})\n`;
+            }
+
+            status += t('shortcuts.success', { count: fixedCount });
+            ctx.reply(status, { parse_mode: 'HTML' });
+        } catch (e) {
+            ctx.reply(t('shortcuts.start_error', { error: e.message }));
+        }
+    } else if (platform === 'win32') {
+        // Windows: PowerShell approach
+        const psScriptPath = path.join(os.tmpdir(), 'fix_shortcuts.ps1');
+        const psScript = `
+$sh = New-Object -ComObject WScript.Shell
+$desktop = [System.IO.Path]::Combine($env:USERPROFILE, "Desktop")
+
+# 1. Standalone Agent (Port ${agentPort})
+$lnkAgent = Join-Path $desktop "Antigravity.lnk"
+if (Test-Path $lnkAgent) {
+    $lnk = $sh.CreateShortcut($lnkAgent)
+    $lnk.Arguments = "--remote-debugging-port=${agentPort}"
+    $lnk.Save()
+    Write-Output "agent-fixed"
+}
+
+# 2. Classic IDE (Port ${idePort})
+$lnkIDE = Join-Path $desktop "Antigravity IDE.lnk"
+if (Test-Path $lnkIDE) {
+    $lnk = $sh.CreateShortcut($lnkIDE)
+    $lnk.Arguments = "--remote-debugging-port=${idePort}"
+    $lnk.Save()
+    Write-Output "ide-fixed"
+}
+`;
+
+        try {
+            fs.writeFileSync(psScriptPath, psScript, 'utf8');
+            exec(`powershell -ExecutionPolicy Bypass -File "${psScriptPath}"`, (err, stdout, stderr) => {
+                try { fs.unlinkSync(psScriptPath); } catch (_) {}
+                
+                if (err) {
+                    console.error('[fix_shortcuts] Error:', err);
+                    return ctx.reply(t('shortcuts.error', { error: err.message }), { parse_mode: 'HTML' });
+                }
+                
+                let status = t('shortcuts.updated_header');
+                const output = stdout.toLowerCase();
+                let fixedCount = 0;
+                if (output.includes('agent-fixed')) {
+                    status += `\u2022 \ud83e\udd16 <b>Antigravity.lnk</b> -> <code>--remote-debugging-port=${agentPort}</code> \u2705\n`;
+                    fixedCount++;
+                } else {
+                    status += '\u2022 \ud83e\udd16 <i>Antigravity.lnk</i> (' + t('shortcuts.not_found') + ')\n';
+                }
+                if (output.includes('ide-fixed')) {
+                    status += `\u2022 \ud83d\udcbb <b>Antigravity IDE.lnk</b> -> <code>--remote-debugging-port=${idePort}</code> \u2705\n`;
+                    fixedCount++;
+                } else {
+                    status += '\u2022 \ud83d\udcbb <i>Antigravity IDE.lnk</i> (' + t('shortcuts.not_found') + ')\n';
+                }
+                
+                status += t('shortcuts.success', { count: fixedCount });
+                ctx.reply(status, { parse_mode: 'HTML' });
+            });
+        } catch (e) {
+            ctx.reply(t('shortcuts.start_error', { error: e.message }));
+        }
+    } else if (platform === 'darwin') {
+        // macOS: osacompile kullanarak masaüstüne başlatıcı .app'ler oluşturur
+        try {
+            const { execSync } = require('child_process');
+            const desktop = path.join(os.homedir(), 'Desktop');
+            let fixedCount = 0;
+            let status = t('shortcuts.updated');
+            
+            // 1. Standalone Agent (Port ${agentPort})
+            const agentBinary = getAppBinary('agent'); // Uygulamanın .app dizinini döndürür
+            if (fs.existsSync(agentBinary)) {
+                const agentAppPath = path.join(desktop, 'Antigravity Agent (CDP).app');
+                // open -a komutuyla uygulamayı debug portu ile başlatacak script
+                const script = `do shell script "open -a \\"${agentBinary}\\" --args --remote-debugging-port=${agentPort}"`;
+                execSync(`osacompile -e '${script}' -o "${agentAppPath}"`);
+                status += `• 🤖 <b>Antigravity Agent (CDP).app</b> -> <code>Port ${agentPort}</code> ✅\n`;
+                fixedCount++;
+            }
+            
+            // 2. Classic IDE (Port ${idePort})
+            const ideBinary = getAppBinary('ide');
+            if (fs.existsSync(ideBinary)) {
+                const ideAppPath = path.join(desktop, 'Antigravity IDE (CDP).app');
+                const script = `do shell script "open -a \\"${ideBinary}\\" --args --remote-debugging-port=${idePort}"`;
+                execSync(`osacompile -e '${script}' -o "${ideAppPath}"`);
+                status += `• 💻 <b>Antigravity IDE (CDP).app</b> -> <code>Port ${idePort}</code> ✅\n`;
+                fixedCount++;
+            }
+            
+            status += t('shortcuts.success', { count: fixedCount });
+            ctx.reply(status, { parse_mode: 'HTML' });
+        } catch (e) {
+            ctx.reply(t('shortcuts.start_error', { error: e.message }));
+        }
+    } else {
+        ctx.reply(t('shortcuts.unsupported_platform') || '\u26a0\ufe0f Bu platform i\u00e7in k\u0131sayol d\u00fczeltme hen\u00fcz desteklenmiyor.');
+    }
+});
+
+
+// ===== WINDOW SELECTION =====
+
+bot.command('window', async (ctx) => {
+    try {
+        const windows = await listWindows(CDP_PORT);
+        if (windows.length === 0) {
+            return ctx.reply(t('window.not_found') || 'No IDE windows found. Send /start_ide first.');
+        }
+        
+        const current = getPreferredWindow();
+        let msg = t('window.title') || '<b>🔳 IDE Windows</b>\n';
+        if (current) {
+            const currentLabel = current.length > 40 ? current.substring(0, 40) + '...' : current;
+            msg += (t('window.current', { current: currentLabel }) || `Current target: <i>${currentLabel}</i>`) + '\n';
+        } else {
+            msg += (t('window.auto') || 'Target: <i>auto (first available)</i>') + '\n';
+        }
+        msg += '\n' + (t('window.found', { count: windows.length }) || `Found ${windows.length} window(s). Tap to select:`);
+        
+        const buttons = windows.map((w, i) => {
+            const icon = w.isPreferred ? '✅' : '🔳';
+            // Extract meaningful part of title (usually "folder - Antigravity")
+            const label = w.title.length > 40 ? w.title.substring(0, 40) + '...' : w.title;
+            return [{ text: `${icon} ${label}`, callback_data: `wn_${w.id.substring(0,8)}` }];
+        });
+        
+        // Add "auto" button to clear preference
+        if (current) {
+            buttons.push([{ text: t('window.clear_btn') || '🔄 Auto (clear preference)', callback_data: 'wn_auto' }]);
+        }
+        
+        ctx.reply(msg, {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: buttons }
+        });
+    } catch (e) {
+        ctx.reply((t('window.error', { error: e.message }) || `Window list error: ${e.message}`));
+    }
+});
+
+bot.action('wn_auto', (ctx) => {
+    setPreferredWindow(null);
+    ctx.answerCbQuery(t('window.cleared_toast') || 'Cleared — using auto-detect');
+    const text = t('window.cleared_msg') || '🔄 Window preference cleared. Bot will auto-detect the active IDE window.';
+    if (ctx.callbackQuery && ctx.callbackQuery.message) {
+        ctx.editMessageText(text).catch(e => {
+            if (!e.message.includes('message is not modified')) ctx.reply(text);
+        });
+    } else {
+        ctx.reply(text);
+    }
+});
+
+bot.action(/wn_(.+)/, (ctx) => {
+    const idPrefix = ctx.match[1];
+    const windows = getCachedWindows();
+    if (!windows || windows.length === 0) {
+        return ctx.answerCbQuery(t('window.expired') || 'Window list expired. Send /window again.');
+    }
+    const selected = windows.find(w => w.id.startsWith(idPrefix));
+    if (!selected) {
+        return ctx.answerCbQuery(t('window.expired') || 'Window list expired. Send /window again.');
+    }
+    
+    // Save preference by ID
+    setPreferredWindow(selected.id);
+    const shortTitle = selected.title.substring(0, 30);
+    ctx.answerCbQuery(t('window.selected_toast', { title: shortTitle }) || `Selected: ${shortTitle}`);
+    
+    const text = t('window.selected_msg', { title: selected.title }) || `✅ Now targeting: <b>${selected.title}</b>\n\nAll commands will route to this window.`;
+    if (ctx.callbackQuery && ctx.callbackQuery.message) {
+        ctx.editMessageText(text, { parse_mode: 'HTML' }).catch(e => {
+            if (!e.message.includes('message is not modified')) ctx.reply(text, { parse_mode: 'HTML' });
+        });
+    } else {
+        ctx.reply(text, { parse_mode: 'HTML' });
+    }
+    
+    // Auto-show latest agent response from the new window
+    (async () => {
+        try {
+            await new Promise(r => setTimeout(r, 800));
+            let _latestRes = await getFullLatestResponse(CDP_PORT);
+            let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
+            let buttons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
+            
+            if (text && !text.startsWith('[No previous')) {
+                const header = await getChatHeader(null, t('latest.last_agent_reply'));
+                await sendBotMessage(ctx, text, header, buttons);
+            }
+        } catch(_) {}
+    })();
+
+    // Explicitly re-inject autoaccept into the selected window to ensure it tracks
+    if (autoaccept.isEnabled) {
+        autoaccept.enable(CDP_PORT).catch(() => {});
+    }
+});
+
+bot.action(/focus_(.+)/, async (ctx) => {
+    const idPrefix = ctx.match[1];
+    const windows = await listWindows(CDP_PORT);
+    const selected = windows.find(w => w.id.startsWith(idPrefix));
+    if (!selected) {
+        return ctx.answerCbQuery(t('agents.window_not_found'));
+    }
+    setPreferredWindow(selected.id);
+    const shortTitle = selected.title.substring(0, 30);
+    ctx.answerCbQuery(t('ask.focus_toast', { title: shortTitle }));
+    ctx.reply(t('ask.focus_success', { title: selected.title }), { 
+        parse_mode: 'HTML',
+        reply_parameters: { message_id: ctx.callbackQuery.message.message_id, allow_sending_without_reply: true }
+    });
+});
+
+// ===== FILE EXPLORER =====
+
+let currentWorkspaceDir = config.projectsDir;
+
+const pathCache = new Map();
+let pathIdCounter = 0;
+function getPathId(fullPath) {
+    for (const [id, p] of pathCache.entries()) {
+        if (p === fullPath) return id;
+    }
+    const id = (++pathIdCounter).toString(36);
+    pathCache.set(id, fullPath);
+    if (pathCache.size > 2000) {
+        const firstKey = pathCache.keys().next().value;
+        pathCache.delete(firstKey);
+    }
+    return id;
+}
+
+function listDirectory(ctx, dirPath, page = 0) {
+    const PAGE_SIZE = 8;
+    fs.readdir(dirPath, { withFileTypes: true }, (err, entries) => {
+        if (err) return ctx.reply(t('file.dir_read_error', { error: err.message }));
+        
+        const filtered = entries
+            .filter(e => !e.name.startsWith('.') && e.name !== 'node_modules')
+            .sort((a, b) => {
+                if (a.isDirectory() && !b.isDirectory()) return -1;
+                if (!a.isDirectory() && b.isDirectory()) return 1;
+                return a.name.localeCompare(b.name);
+            });
+        
+        const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+        const pageEntries = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+        
+        if (pageEntries.length === 0) {
+            return ctx.reply(t('file.empty_dir'));
+        }
+        
+        const buttons = pageEntries.map(e => {
+            const icon = e.isDirectory() ? '📂' : '📄';
+            const fullPath = path.join(dirPath, e.name);
+            const pathId = getPathId(fullPath);
+            const action = e.isDirectory() ? 'fd_' : 'ff_';
+            return [{ text: `${icon} ${e.name}`, callback_data: `${action}${pathId}` }];
+        });
+        
+        const navRow = [];
+        const parentDir = path.dirname(dirPath);
+        if (parentDir !== dirPath && dirPath !== config.projectsDir) {
+            const parentId = getPathId(parentDir);
+            navRow.push({ text: t('file.parent_dir'), callback_data: `fd_${parentId}` });
+        }
+        
+        const dirPathId = getPathId(dirPath);
+        if (page > 0) {
+            navRow.push({ text: t('file.prev_page'), callback_data: `fp_${dirPathId}|${page - 1}` });
+        }
+        if (page < totalPages - 1) {
+            navRow.push({ text: t('file.next_page'), callback_data: `fp_${dirPathId}|${page + 1}` });
+        }
+        if (navRow.length > 0) buttons.push(navRow);
+        
+        const relativePath = dirPath.replace(config.home, '~');
+        const dirInfo = t('file.dir_info', { count: filtered.length, page: page + 1, totalPages: totalPages || 1 });
+        const text = `📂 <b>${relativePath}</b>\n${dirInfo}`;
+        const extra = {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: buttons }
+        };
+        
+        if (ctx.callbackQuery && ctx.callbackQuery.message) {
+            ctx.editMessageText(text, extra).catch(e => {
+                if (!e.message.includes('message is not modified')) {
+                    ctx.reply(text, extra);
+                }
+            });
+        } else {
+            ctx.reply(text, extra);
+        }
+    });
+}
+
+bot.command('file', (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    parts.shift();
+    const filePath = parts.join(' ').trim();
+    
+    if (!filePath) {
+        listDirectory(ctx, currentWorkspaceDir);
+        return;
+    }
+    
+    const fullPath = filePath.startsWith('/') || filePath.match(/^[A-Z]:\\/) 
+        ? filePath 
+        : path.join(currentWorkspaceDir, filePath);
+    if (!fs.existsSync(fullPath)) {
+        return ctx.reply(t('file.not_found', { path: fullPath }));
+    }
+    
+    const stat = fs.statSync(fullPath);
+    if (stat.isDirectory()) {
+        listDirectory(ctx, fullPath);
+        return;
+    }
+    
+    if (stat.size > 50 * 1024 * 1024) {
+        return ctx.reply(t('file.too_large', { size: (stat.size / 1024 / 1024).toFixed(1) }));
+    }
+    
+    ctx.replyWithDocument({ source: fullPath, filename: path.basename(fullPath) })
+        .catch(e => ctx.reply(t('file.send_failed', { error: e.message })));
+});
+
+bot.action(/fd_(.+)/, (ctx) => {
+    try {
+        const pathId = ctx.match[1];
+        const dirPath = pathCache.get(pathId);
+        if (!dirPath) return ctx.answerCbQuery(t('file.expired'));
+        ctx.answerCbQuery();
+        listDirectory(ctx, dirPath);
+    } catch(e) {
+        ctx.answerCbQuery(t('model.error'));
+    }
+});
+
+bot.action(/ff_(.+)/, (ctx) => {
+    try {
+        const pathId = ctx.match[1];
+        const filePath = pathCache.get(pathId);
+        if (!filePath) return ctx.answerCbQuery(t('file.expired'));
+        
+        ctx.answerCbQuery(t('file.sending', { filename: path.basename(filePath) }));
+        
+        const stat = fs.statSync(filePath);
+        if (stat.size > 50 * 1024 * 1024) {
+            return ctx.reply(t('file.too_large', { size: (stat.size / 1024 / 1024).toFixed(1) }));
+        }
+        
+        ctx.replyWithDocument({ source: filePath, filename: path.basename(filePath) })
+            .catch(e => ctx.reply(t('file.send_failed', { error: e.message })));
+    } catch(e) {
+        ctx.answerCbQuery(t('model.error'));
+    }
+});
+
+bot.action(/fp_(.+)/, (ctx) => {
+    try {
+        const matchData = ctx.match[1];
+        const [pathId, pageStr] = matchData.split('|');
+        const dirPath = pathCache.get(pathId);
+        if (!dirPath) return ctx.answerCbQuery(t('file.expired'));
+        
+        ctx.answerCbQuery();
+        listDirectory(ctx, dirPath, parseInt(pageStr) || 0);
+    } catch(e) {
+        ctx.answerCbQuery(t('model.error'));
+    }
+});
+
+// ===== MENU REGISTRATION =====
+
+function getMenuCommands() {
+    const cmds = [
+        { command: 'help', description: t('menu.help_desc') },
+        { command: 'latest', description: t('menu.latest_desc') },
+        { command: 'screenshot', description: t('menu.screenshot_desc') },
+        { command: 'status', description: t('menu.status_desc') },
+        { command: 'start_ide', description: t('menu.start_ide_desc') || 'Start IDE' },
+        { command: 'start_ag', description: t('menu.start_ag_desc') || 'Start Agent' },
+        { command: 'close_ide', description: t('menu.close_ide_desc') || 'Close IDE' },
+        { command: 'close_ag', description: t('menu.close_ag_desc') || 'Close Agent' },
+        { command: 'new', description: t('menu.new_desc') },
+        { command: 'agents', description: t('menu.agents_desc') },
+        { command: 'artifacts', description: t('menu.artifacts_desc') },
+        { command: 'skills', description: 'Browse and search installed Agent Skills' },
+        { command: 'model', description: t('menu.model_desc') },
+        { command: 'workspace', description: t('menu.workspace_desc') },
+        { command: 'memory', description: 'Check or toggle Project Memory' },
+        { command: 'window', description: t('menu.window_desc') || 'Select IDE window' },
+        { command: 'close_window', description: t('menu.close_window_desc') || 'Close current window' },
+        { command: 'closeall', description: t('menu.closeall_desc') || 'Close all open file tabs' },
+        { command: 'lang', description: t('menu.lang_desc') },
+        { command: 'cmd', description: t('menu.cmd_desc') },
+        { command: 'file', description: t('menu.file_desc') },
+        { command: 'stop', description: t('menu.stop_desc') },
+        { command: 'autoaccept', description: t('menu.autoaccept_desc') },
+        { command: 'quota', description: t('menu.quota_desc') },
+        { command: 'update', description: t('menu.update_desc') || 'Check for updates' },
+        { command: 'force_update', description: t('menu.force_update_desc') || 'Force update (overwrites local changes)' },
+        { command: 'version', description: t('menu.version_desc') || 'Show current version' },
+        { command: 'menu', description: t('menu.menu_desc') },
+        { command: 'app', description: t('menu.app_desc') || 'Select active application' },
+        { command: 'fix_shortcuts', description: t('menu.fix_shortcuts_desc') || 'Fix desktop shortcuts' },
+        { command: 'restart', description: t('menu.restart_desc') || 'Restart the bot' },
+        { command: 'goal', description: t('menu.goal_desc') || 'Set autonomous goal for agent' },
+        { command: 'plan', description: t('menu.plan_desc') || 'Generate implementation plan' },
+        { command: 'schedule_task', description: t('menu.schedule_task_desc') || 'Schedule a task in IDE' },
+        { command: 'schedule_setup', description: t('schedule.menu_schedule_setup_desc') || 'Setup CronCrew connection' },
+        { command: 'schedule_list', description: t('schedule.menu_schedule_list_desc') || 'List scheduled tasks' },
+        { command: 'schedule_add', description: t('schedule.menu_schedule_add_desc') || 'Add a new schedule' },
+        { command: 'schedule_status', description: t('schedule.menu_schedule_status_desc') || 'Show CronCrew status' },
+        { command: 'login', description: t('menu.login_desc') || 'Sign in with Google' },
+        { command: 'accounts', description: t('menu.accounts_desc') || 'List saved Google accounts' },
+        { command: 'switchacc', description: t('menu.switchacc_desc') || 'Switch active Google account' },
+        { command: 'getinfo', description: t('menu.getinfo_desc') || 'View account quota info' },
+        { command: 'delacc', description: t('menu.delacc_desc') || 'Delete a saved Google account' },
+        { command: 'gettask', description: t('menu.gettask_desc') || 'Get the latest Task Checklist' },
+        { command: 'getplan', description: t('menu.getplan_desc') || 'Get the latest Implementation Plan' },
+        { command: 'getwalk', description: t('menu.getwalk_desc') || 'Get the latest Walkthrough' },
+        { command: 'watcher', description: t('menu.watcher_desc') || 'Toggle background Task Watcher' },
+        { command: 'telegraph', description: t('menu.telegraph_desc') || 'Toggle Telegraph artifact uploads' },
+        { command: 'cleartelegraph', description: t('menu.cleartelegraph_desc') || 'Wipe published Telegraph pages' }
+    ];
+
+    return cmds.sort((a, b) => a.command.localeCompare(b.command));
+}
+
+/**
+ * Delete commands from ALL Telegram scopes and language codes
+ * to prevent stale entries from overriding the default menu.
+ */
+async function clearAllMenuScopes() {
+    const scopes = [
+        { type: 'default' },
+        { type: 'all_private_chats' },
+        { type: 'all_group_chats' },
+        { type: 'all_chat_administrators' }
+    ];
+    const langs = ['', 'en', 'tr'];
+    
+    for (const scope of scopes) {
+        for (const lang of langs) {
+            try {
+                const params = { scope };
+                if (lang) params.language_code = lang;
+                await bot.telegram.callApi('deleteMyCommands', params);
+            } catch (_) {}
+        }
+    }
+    
+    // Also clear chat-specific scope if ALLOWED_CHAT_IDS is set
+    for (const chat_id of ALLOWED_CHAT_IDS) {
+        for (const lang of langs) {
+            try {
+                const params = { scope: { type: 'chat', chat_id: parseInt(chat_id) } };
+                if (lang) params.language_code = lang;
+                await bot.telegram.callApi('deleteMyCommands', params);
+            } catch (_) {}
+        }
+    }
+}
+
+/**
+ * Set commands on all relevant scopes, utilizing Telegram's native localized menus.
+ * We register menus for all available languages ('en', 'tr') plus the default.
+ */
+async function setMenuOnAllScopes() {
+    const langs = fs.readdirSync(path.join(__dirname, '..', 'locales'))
+        .filter(f => f.endsWith('.json'))
+        .map(f => f.replace('.json', ''));
+    const defaultLang = process.env.LANGUAGE || 'en';
+    const originalLang = getLang(); // Save the user's active language
+
+    // Helper to register commands for a specific language and scope
+    const register = async (langCode) => {
+        // Temporarily load this locale to generate translated commands
+        loadLocale(langCode);
+        const cmds = getMenuCommands();
+        
+        const paramsDefault = { commands: cmds };
+        const paramsPrivate = { commands: cmds, scope: { type: 'all_private_chats' } };
+        
+        // If it's not the default fallback, specify the language_code so Telegram routes it natively
+        if (langCode !== defaultLang) {
+            paramsDefault.language_code = langCode;
+            paramsPrivate.language_code = langCode;
+        }
+
+        await bot.telegram.callApi('setMyCommands', paramsDefault).catch(()=>{});
+        await bot.telegram.callApi('setMyCommands', paramsPrivate).catch(()=>{});
+
+        if (langCode === originalLang) {
+            for (const chat_id of ALLOWED_CHAT_IDS) {
+                const paramsChat = { 
+                    commands: cmds, 
+                    scope: { type: 'chat', chat_id: parseInt(chat_id) } 
+                };
+                await bot.telegram.callApi('setMyCommands', paramsChat).catch(()=>{});
+            }
+        }
+    };
+
+    // 1. Register the non-default languages (e.g. 'en')
+    for (const l of langs) {
+        if (l !== defaultLang) await register(l);
+    }
+    // 2. Register the default fallback language last (no language_code)
+    await register(defaultLang);
+    
+    // 3. Restore the original active language
+    loadLocale(originalLang);
+}
+
+bot.command('menu', async (ctx) => {
+    await clearAllMenuScopes();
+    await setMenuOnAllScopes();
+    await sendMainMenu(ctx, t('menu.updated'));
+});
+
+// ===== UPDATE & VERSION =====
+
+bot.command('version', async (ctx) => {
+    const local = updater.getLocalVersion();
+    ctx.reply(
+        `📦 <b>Antigravity Telegram Suite</b>\n\n` +
+        `Version: <code>v${local.version}</code>\n` +
+        `Commit: <code>${local.commitHash}</code>`,
+        { parse_mode: 'HTML' }
+    );
+});
+
+async function handleForceUpdate(ctx) {
+    if (ctx.callbackQuery) {
+        await ctx.answerCbQuery(t('update.updating') || 'Updating...').catch(() => {});
+    }
+    await ctx.reply(
+        t('update.force_updating') || '⚡️ <b>[Force Update]</b> Force update in progress...\nDiscarding local modifications and syncing with <code>origin/main</code>...',
+        { parse_mode: 'HTML' }
+    );
+
+    try {
+        const updateResult = await updater.performForceUpdate((err2) => {
+            const pmId = process.env.pm_id || 'antigravity-telegram-suite';
+            ctx.reply(`⚠️ Failed to restart automatically.\nPM2 Error: <code>${err2.message}</code>\n\nPlease run manually:\n<code>pm2 restart ${pmId}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+        });
+        await ctx.reply(`ℹ️ ${updateResult.message}`);
+    } catch (e) {
+        ctx.reply(t('update.error', { error: e.message }));
+    }
+}
+
+bot.command('force_update', handleForceUpdate);
+bot.command('forceupdate', handleForceUpdate);
+bot.action('force_update', handleForceUpdate);
+
+bot.command('update', async (ctx) => {
+    const text = ctx.message?.text || '';
+    const args = text.split(/\s+/).slice(1);
+    if (args.some(a => ['force', 'zorla', '-f', '--force'].includes(a.toLowerCase()))) {
+        return handleForceUpdate(ctx);
+    }
+
+    ctx.reply(t('update.checking'));
+    try {
+        const result = await updater.checkForUpdates();
+        if (!result.available) {
+            ctx.reply(
+                t('update.up_to_date', { version: result.localVersion, commit: result.localCommit }),
+                { parse_mode: 'HTML' }
+            );
+            return;
+        }
+        await ctx.reply(
+            t('update.available') +
+            t('update.current_version', { version: result.localVersion, commit: result.localCommit }) +
+            t('update.new_version_info', { version: result.remoteVersion, commit: result.remoteCommit }) +
+            (result.remoteCommitMessage ? t('update.changelog', { message: result.remoteCommitMessage }) : `\n`) +
+            t('update.update_note') +
+            t('update.updating'),
+            { parse_mode: 'HTML' }
+        );
+        const updateResult = await updater.performUpdate((err2) => {
+            const pmId = process.env.pm_id || 'antigravity-telegram-suite';
+            ctx.reply(`⚠️ Failed to restart automatically.\nPM2 Error: <code>${err2.message}</code>\n\nPlease run manually:\n<code>pm2 restart ${pmId}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+        });
+        await ctx.reply(`ℹ️ ${updateResult.message}`);
+    } catch(e) {
+        const replyMarkup = Markup.inlineKeyboard([
+            [Markup.button.callback(t('update.btn_force_update') || '⚡️ Force Update (Overwrite)', 'force_update')]
+        ]);
+        const warning = t('update.conflict_warning') || '⚠️ Local conflicts or merge issues detected. You can force update to the latest version. Note: Any local file modifications will be overwritten.\n\n👉 Use /force_update or click the button below:';
+        ctx.reply(`${t('update.error', { error: e.message })}\n\n${warning}`, {
+            parse_mode: 'HTML',
+            ...replyMarkup
+        });
+    }
+});
+
+// ===== TURBO / COUNCIL MODE =====
+
+async function handleTurbo(ctx) {
+    isTurboMode = !isTurboMode; // Toggle
+    
+    if (!isTurboMode) {
+        if (turboPinnedMsgId) {
+            try {
+                await ctx.telegram.unpinChatMessage(ctx.chat.id, turboPinnedMsgId);
+            } catch (e) {}
+            turboPinnedMsgId = null;
+        }
+        saveTurboState();
+        await sendMainMenu(ctx, t('turbo.off'));
+    } else {
+        const msg = await ctx.reply(
+            t('turbo.on_msg'), 
+            { parse_mode: 'HTML' }
+        );
+        turboPinnedMsgId = msg.message_id;
+        try {
+            await ctx.telegram.pinChatMessage(ctx.chat.id, turboPinnedMsgId);
+        } catch (e) {}
+        saveTurboState();
+        await sendMainMenu(ctx, t('turbo.on_toast') || '🚀 Turbo Mod devrede!');
+    }
+}
+
+bot.command('turbo', handleTurbo);
+bot.hears(/^🚀/i, handleTurbo);
+
+bot.action('turbo_force_stop', async (ctx) => {
+    isTurboRunning = false;
+    isTurboMode = false;
+    saveTurboState();
+    try { stopAgent(CDP_PORT); } catch(e) {}
+    await ctx.editMessageText('🛑 Turbo Mode has been force stopped. You can now send your message.').catch(() => {});
+});
+
+bot.action('turbo_cancel', async (ctx) => {
+    await ctx.deleteMessage().catch(() => {});
+});
+
+// ===== TEXT MESSAGE HANDLER (Headless mode) =====
+
+bot.command('panel', async (ctx) => {
+    await sendMainMenu(ctx);
+});
+
+bot.hears(/^🤖/i, async (ctx) => {
+    const preferredApp = process.env.ANTIGRAVITY_PREFERRED_APP || 'agent';
+    const isIDE = preferredApp === 'ide';
+    
+    if (isIDE) {
+        // ide modunda bu buton workspace adını gösteriyor, bu yüzden workspace menüsünü aç
+        ctx.message.text = '/workspace';
+        return handleWorkspace(ctx);
+    }
+    
+    // 🤖 butonu aktif ajanı gösteriyor — tıklanınca /agents listesini tetikle
+    try {
+        await renderAndSendAgentThreads(ctx, CDP_PORT);
+    } catch (e) {
+        ctx.reply((t('agents.error') || '❌ Error: ') + e.message);
+    }
+});
+bot.hears(/^🧠/i, handleModel);
+
+function extractQuotedContext(ctx) {
+    if (!ctx.message.reply_to_message) return "";
+    const msg = ctx.message.reply_to_message;
+    let quotedText = msg.text || msg.caption || "";
+    if (!quotedText) return "";
+    
+    quotedText = quotedText.replace(/✅ Completed!/g, '');
+    quotedText = quotedText.replace(/📁[^\n]+/g, '');
+    quotedText = quotedText.replace(/🤖[^\n]+/g, '');
+    const swipeText = t('agent.swipe_to_reply').replace(/<[^>]+>/g, '');
+    if (swipeText) {
+        quotedText = quotedText.replace(new RegExp(swipeText.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'gi'), '');
+    }
+    quotedText = quotedText.replace(/🤖 Agent:/g, '');
+    quotedText = quotedText.trim();
+    
+    if (quotedText.length > 500) {
+        quotedText = quotedText.substring(0, 500) + '...';
+    }
+    
+    return quotedText ? `[Replying to Agent's message: "${quotedText}"]\n\n` : "";
+}
+
+
+// ===== INTERACTIVE MODAL ANSWER HANDLER =====
+bot.action(/^ans_(.+)$/, async (ctx) => {
+    const answer = ctx.match[1];
+    await ctx.answerCbQuery(t('interactive_modal.answer_sent', { answer }));
+    
+    let targetId = getPreferredTargetId();
+    let explicitThreadName = null;
+    if (ctx.callbackQuery.message) {
+        const val = messageTargetMap.get(ctx.callbackQuery.message.message_id);
+        if (typeof val === 'string') targetId = val;
+        else if (val) { targetId = val.targetId; explicitThreadName = val.threadName; }
+    }
+    
+    // Fire-and-forget: don't block Telegraf's update loop
+    (async () => {
+        isAgentBusy = true;
+        if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
+        try {
+            if (ctx.callbackQuery?.message) {
+                await ctx.editMessageReplyMarkup({
+                    inline_keyboard: [[{ text: `✅ ${answer}`, callback_data: 'noop' }]]
+                }).catch(() => {});
+            }
+
+            if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
+            setReaction(ctx, REACTION.THINKING, ctx.callbackQuery.message?.message_id).catch(() => {});
+            const res = await sendViaCDP(answer, CDP_PORT, targetId);
+            if (typeof res === 'string' && res !== "INVALID_MODAL_OPTION") targetId = res;
+            
+            if (res === "INVALID_MODAL_OPTION") {
+                return await ctx.reply(t('error.modal_active') || 'A modal is currently active in the IDE. Please select a valid option or dismiss it before sending a message.');
+            }
+
+            await new Promise(r => setTimeout(r, 500));
+            await snapshotChatState(CDP_PORT, targetId).catch(() => {});
+
+            const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
+            let text = "";
+            let interactiveButtons = null;
+            if (isDone) {
+                await new Promise(r => setTimeout(r, 500));
+                let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, explicitThreadName);
+                text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
+                interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
+                text = stripQueryFromResponse(text, answer);
+            } else {
+                return await ctx.reply(t('ask.timeout'));
+            }
+            
+            if (!text) text = t('ask.done_empty');
+            const header = await getChatHeader(targetId, t('ask.done'));
+            const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
+
+            const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.callbackQuery.message.message_id);
+            if (sentIds && sentIds.length > 0 && targetId) {
+                const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
+                const currentThreadName = activeInfo ? activeInfo.name : null;
+                sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
+                saveMessageTargetMap(messageTargetMap);
+            }
+        } catch (e) {
+            ctx.reply(t('error.general_error', { error: e.message })).catch(()=>{});
+        } finally {
+            isAgentBusy = false;
+            if (global.__taskWatcher) {
+                global.__taskWatcher.setBusy(false);
+                global.__taskWatcher.syncBaseline();
+            }
+        }
+    })();
+});
+
+let isAgentBusy = false;
+
+// Feedback proceed/cancel handlers
+    bot.action(/^fb_proceed_(.+)$/, async (ctx) => {
+        const convId = ctx.match[1];
+        try {
+            await ctx.answerCbQuery(t('artifact_feedback.processing') || 'Processing...');
+            await clickArtifactButton('Proceed', CDP_PORT, null);
+            await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: t('artifact_feedback.proceeded') || '✅ Proceeded', callback_data: 'noop' }]] });
+        } catch (e) {
+            console.error(e);
+            const errMsg = t('artifact_feedback.error', { message: e.message }) || ('Error: ' + e.message);
+            await ctx.answerCbQuery(errMsg, { show_alert: true });
+        }
+    });
+
+    bot.action(/^fb_cancel_(.+)$/, async (ctx) => {
+        const convId = ctx.match[1];
+        try {
+            await ctx.answerCbQuery(t('artifact_feedback.processing') || 'Processing...');
+            await clickArtifactButton('Cancel', CDP_PORT, null);
+            await ctx.editMessageReplyMarkup({ inline_keyboard: [[{ text: t('artifact_feedback.canceled') || '❌ Canceled', callback_data: 'noop' }]] });
+        } catch (e) {
+            console.error(e);
+            const errMsg = t('artifact_feedback.error', { message: e.message }) || ('Error: ' + e.message);
+            await ctx.answerCbQuery(errMsg, { show_alert: true });
+        }
+    });
+
+    bot.action('noop', async (ctx) => {
+        await ctx.answerCbQuery();
+    });
+
+    function resolveEffectiveConversationId() {
+        try {
+            const statePath = path.join(__dirname, '..', '.state.json');
+            if (fs.existsSync(statePath)) {
+                const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+                if (state.syncMode === 'pinned' && state.syncedConversationId) {
+                    return state.syncedConversationId;
+                }
+            }
+        } catch (_) {}
+        return getLastResolvedThreadId() || (global.__taskWatcher ? global.__taskWatcher._findMostRecentConversation() : null);
+    }
+
+    // Default text handler
+    const KNOWN_BOT_COMMANDS = new Set([
+        'start', 'help', 'latest', 'screenshot', 'status', 'start_ide', 'start_ag', 'close_ide', 'close_ag',
+        'close', 'close_window', 'closeall', 'new', 'agents', 'artifacts', 'skills', 'skill',
+        'model', 'workspace', 'memory', 'window', 'lang', 'cmd', 'file', 'stop', 'autoaccept', 'quota', 'update',
+        'force_update', 'forceupdate',
+        'version', 'menu', 'app', 'fix_shortcuts', 'restart', 'goal', 'plan', 'schedule_task', 'schedule_setup',
+        'schedule_list', 'schedule_add', 'schedule_del', 'schedule_status', 'login', 'logincode', 'accounts',
+        'switchacc', 'getinfo', 'delacc', 'gettask', 'getplan', 'getwalk', 'watcher', 'turbo', 'panel', 'ask'
+    ]);
+
+    bot.on('text', async (ctx, next) => {
+        const firstWord = ctx.message.text.split(/[\s@]+/)[0].replace(/^\//, '').toLowerCase();
+        if (ctx.message.text.startsWith('/') && KNOWN_BOT_COMMANDS.has(firstWord)) {
+            return next();
+        }
+    let query = ctx.message.text;
+    
+    let explicitTargetId = null;
+    let explicitThreadName = null;
+    if (ctx.message.reply_to_message) {
+        const val = messageTargetMap.get(ctx.message.reply_to_message.message_id);
+        if (typeof val === 'string') explicitTargetId = val;
+        else if (val) { explicitTargetId = val.targetId; explicitThreadName = val.threadName; }
+        
+        query = extractQuotedContext(ctx) + query;
+    }
+    if (!explicitTargetId && ctx.message.reply_to_message?.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('focus_')) {
+        explicitTargetId = ctx.message.reply_to_message.reply_markup.inline_keyboard[0][0].callback_data.replace('focus_', '');
+    }
+
+    const activeDriver = DriverFactory.getDriver();
+    if (activeDriver.appType === 'orca_terminal') {
+        if (isAgentBusy) {
+            return ctx.reply('⏳ Antigravity Agent is currently busy processing a request in the terminal. Please wait a moment...');
+        }
+
+        const activeTerm = await activeDriver.findActiveTerminal(process.env.PROJECTS_DIR || process.cwd());
+        if (!activeTerm) {
+            return ctx.reply('⚠️ No active terminal found in this workspace. Please open an agy terminal tab in Orca.');
+        }
+
+        isAgentBusy = true;
+        const taskWatcher = global.__taskWatcher;
+        if (taskWatcher) taskWatcher.setBusy(true);
+
+        setReaction(ctx, REACTION.THINKING).catch(() => {});
+        ctx.sendChatAction('typing').catch(() => {});
+        const typingInterval = setInterval(() => {
+            ctx.sendChatAction('typing').catch(() => {});
+        }, 4000);
+
+        try {
+            await activeDriver.sendPrompt(query, { terminalHandle: activeTerm.handle });
+            
+            // Resolve conversation ID to tail
+            const convId = resolveEffectiveConversationId();
+            let responseText = 'Prompt sent to terminal.';
+            if (convId && taskWatcher) {
+                responseText = await taskWatcher.waitForNextResponse(convId, {
+                    timeoutMs: 120000,
+                    onProgress: () => ctx.sendChatAction('typing').catch(() => {})
+                });
+            }
+
+            clearInterval(typingInterval);
+            isAgentBusy = false;
+            if (taskWatcher) {
+                taskWatcher.setBusy(false);
+                taskWatcher.syncBaseline(convId);
+            }
+
+            setReaction(ctx, REACTION.SUCCESS).catch(() => {});
+            await sendBotMessage(ctx, responseText, `🤖 Orca Terminal (${activeTerm.handle})`, null, ctx.message.message_id);
+        } catch (err) {
+            clearInterval(typingInterval);
+            isAgentBusy = false;
+            if (taskWatcher) taskWatcher.setBusy(false);
+            setReaction(ctx, REACTION.ERROR).catch(() => {});
+            ctx.reply(`❌ Terminal Execution Error: ${err.message}`).catch(() => {});
+        }
+        return;
+    }
+
+
+    const isHeadless = await shouldUseHeadless(CDP_PORT);
+    if (isHeadless) {
+        if (isAgyExecuting()) {
+            return ctx.reply('⏳ Antigravity Agent is currently busy processing a request. Please wait a moment...');
+        }
+        setReaction(ctx, REACTION.THINKING).catch(() => {});
+        ctx.sendChatAction('typing').catch(() => {});
+        const typingInterval = setInterval(() => {
+            ctx.sendChatAction('typing').catch(() => {});
+        }, 4000);
+
+        try {
+            const responseText = await runAgyPrompt(query, {
+                onProgress: () => ctx.sendChatAction('typing').catch(() => {})
+            });
+            clearInterval(typingInterval);
+            setReaction(ctx, REACTION.SUCCESS).catch(() => {});
+            await sendBotMessage(ctx, responseText, `🤖 Antigravity (${getAgyModel()})`, null, ctx.message.message_id);
+        } catch (err) {
+            clearInterval(typingInterval);
+            setReaction(ctx, REACTION.ERROR).catch(() => {});
+            ctx.reply(`❌ Agent Error: ${err.message}`).catch(() => {});
+        }
+        return;
+    }
+
+    // If agent is already processing, just send the follow-up message without starting a new wait loop
+    if (isAgentBusy && !isTurboMode) {
+        try {
+            if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
+            await sendViaCDPWithRecovery(query, explicitTargetId);
+            setReaction(ctx, REACTION.THINKING).catch(() => {});
+        } catch (err) {
+            ctx.reply(t('ask.headless_error', { error: err.message })).catch(() => {});
+        }
+        return;
+    }
+
+    setReaction(ctx, REACTION.THINKING).catch(() => {});
+
+    // Fire-and-forget: don't block Telegraf's update loop so other commands remain responsive
+    (async () => {
+        try {
+            if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
+            let targetId = explicitTargetId;
+            let text = "";
+            let interactiveButtons = null;
+
+            if (isTurboMode) {
+                isTurboRunning = true;
+                if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
+                try {
+                    const turboTargetId = explicitTargetId || getPreferredTargetId() || null;
+                    text = await runTurboOrchestration(query, CDP_PORT, turboTargetId, ctx, createProgressHandler, stripQueryFromResponse);
+                    targetId = turboTargetId;
+                } finally {
+                    isTurboRunning = false;
+                    if (global.__taskWatcher) {
+                        global.__taskWatcher.setBusy(false);
+                        global.__taskWatcher.syncBaseline();
+                    }
+                }
+            } else {
+                isAgentBusy = true;
+                if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
+                try {
+                    const result = await sendViaCDPWithRecovery(query, explicitTargetId);
+                    if (typeof result === 'string') {
+                        targetId = result;
+                    } else if (result && result.targetId) {
+                        targetId = result.targetId;
+                    } else {
+                        targetId = explicitTargetId || targetId;
+                    }
+                    
+                    if (targetId === "INVALID_MODAL_OPTION") {
+                        return await ctx.reply(t('error.modal_active') || 'A modal is currently active in the IDE. Please select a valid option or dismiss it before sending a message.');
+                    }
+                    setReaction(ctx, REACTION.THINKING).catch(() => {});
+
+                    // Wait briefly for message to render in DOM before anchoring state
+                    await new Promise(r => setTimeout(r, 500));
+                    await snapshotChatState(CDP_PORT, targetId).catch(() => {});
+                    
+                    const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
+                    if (isDone) {
+                        await new Promise(r => setTimeout(r, 500));
+                        let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, explicitThreadName);
+                        text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
+                        interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
+                        
+                        text = stripQueryFromResponse(text, query);
+                    } else {
+                        return await ctx.reply(t('ask.timeout'));
+                    }
+
+                    if (!text) text = t('ask.done_empty');
+                    const header = await getChatHeader(targetId, t('ask.done'));
+                    const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
+                    
+                    const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.message.message_id);
+                    if (sentIds && sentIds.length > 0 && targetId) {
+                        const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
+                        const currentThreadName = activeInfo ? activeInfo.name : null;
+                        sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
+                        saveMessageTargetMap(messageTargetMap);
+                    }
+                } finally {
+                    isAgentBusy = false;
+                    if (global.__taskWatcher) {
+                        global.__taskWatcher.setBusy(false);
+                        global.__taskWatcher.syncBaseline();
+                    }
+                }
+                return;
+            }
+
+            if (!text) text = t('ask.done_empty');
+            const header = await getChatHeader(targetId, t('ask.done'));
+            const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
+            
+            const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.message.message_id);
+            if (sentIds && sentIds.length > 0 && targetId) {
+                const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
+                const currentThreadName = activeInfo ? activeInfo.name : null;
+                sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
+                saveMessageTargetMap(messageTargetMap);
+            }
+        } catch(err) {
+            isAgentBusy = false;
+            if (global.__taskWatcher) {
+                global.__taskWatcher.setBusy(false);
+                global.__taskWatcher.syncBaseline();
+            }
+            const errorMsg = err.message === 'no_chat_input' ? t('ask.no_chat_input') : err.message;
+            ctx.reply(t('ask.headless_error', { error: errorMsg })).catch(() => {});
+        }
+    })();
+});
+
+// ===== PHOTO & DOCUMENT HANDLER =====
+
+const mediaGroupCache = new Map();
+
+async function processAgentRequest(ctx, query, explicitTargetId, explicitThreadName, originalCaption) {
+    isAgentBusy = true;
+    if (global.__taskWatcher) global.__taskWatcher.setBusy(true);
+    try {
+        setReaction(ctx, REACTION.THINKING).catch(() => {});
+        if (explicitThreadName) await switchAgentThread(CDP_PORT, explicitThreadName).catch(()=>{});
+        const result = await sendViaCDPWithRecovery(query, explicitTargetId);
+        let targetId = typeof result === 'string' ? result : (result?.targetId || explicitTargetId);
+        
+        if (targetId === "INVALID_MODAL_OPTION") {
+            ctx.reply(t('error.modal_active'));
+            return;
+        }
+
+        // Wait briefly for message to render in DOM before anchoring state
+        await new Promise(r => setTimeout(r, 500));
+        await snapshotChatState(CDP_PORT, targetId).catch(() => {});
+        
+        const isDone = await waitForAgentResponse(CDP_PORT, 450000, createProgressHandler(ctx), targetId);
+        if (isDone) {
+            await new Promise(r => setTimeout(r, 500));
+            let _latestRes = await getFullLatestResponse(CDP_PORT, targetId, null, false);
+            let text = typeof _latestRes === 'string' ? _latestRes : _latestRes.text;
+            let interactiveButtons = typeof _latestRes === 'string' ? null : _latestRes.buttons;
+            
+            text = stripQueryFromResponse(text, query);
+            if (originalCaption) {
+                text = stripQueryFromResponse(text, originalCaption);
+            }
+            if (!text) text = t('ask.done_empty');
+            const header = await getChatHeader(targetId, t('ask.done'));
+            
+            const buttons = interactiveButtons ? interactiveButtons : await buildMainMenu(null, null, targetId);
+            
+            const sentIds = await sendBotMessage(ctx, text, header, buttons, ctx.message.message_id);
+            if (sentIds && sentIds.length > 0 && targetId) {
+                const activeInfo = await getActiveThreadInfo(CDP_PORT, targetId).catch(() => null);
+                const currentThreadName = activeInfo ? activeInfo.name : null;
+                sentIds.forEach(id => messageTargetMap.set(id, { targetId, threadName: currentThreadName }));
+                saveMessageTargetMap(messageTargetMap);
+            }
+        } else {
+            await ctx.reply(t('ask.timeout'));
+        }
+    } finally {
+        isAgentBusy = false;
+        if (global.__taskWatcher) {
+            global.__taskWatcher.setBusy(false);
+            global.__taskWatcher.syncBaseline();
+        }
+    }
+}
+
+async function processMediaGroup(group) {
+    const ctx = group.ctx;
+    const paths = group.files.map(p => `\`${p}\``).join(', ');
+    const combinedCaption = group.captions.join('\n');
+    
+    const query = `[System: The user has uploaded ${group.files.length} files. You MUST use your \`view_file\` tool to examine ALL files at these absolute paths: ${paths} . Do not say you cannot see them. Use the tool!]${combinedCaption ? `\nUser's message: ${combinedCaption}` : ''}`;
+    
+    try {
+        await processAgentRequest(ctx, query, group.explicitTargetId, group.explicitThreadName, combinedCaption);
+    } catch(err) {
+        const errorMsg = err.message === 'no_chat_input' ? t('ask.no_chat_input') : err.message;
+        ctx.reply(t('photo.error', { error: errorMsg })).catch(() => {});
+    }
+}
+
+bot.on(['photo', 'document', 'voice', 'audio'], (ctx) => {
+    (async () => {
+        try {
+            let fileId;
+            let fileName = "telegram_upload";
+            let isVoiceOrAudio = false;
+            
+            if (ctx.message.photo) {
+                const photos = ctx.message.photo;
+                fileId = photos[photos.length - 1].file_id;
+                fileName += ".jpg";
+            } else if (ctx.message.document) {
+                fileId = ctx.message.document.file_id;
+                fileName = ctx.message.document.file_name || "telegram_upload.file";
+            } else if (ctx.message.voice) {
+                fileId = ctx.message.voice.file_id;
+                fileName = `telegram_voice_${Date.now()}.ogg`;
+                isVoiceOrAudio = true;
+            } else if (ctx.message.audio) {
+                fileId = ctx.message.audio.file_id;
+                fileName = ctx.message.audio.file_name || `telegram_audio_${Date.now()}.mp3`;
+                isVoiceOrAudio = true;
+            }
+            
+            const fileLink = await ctx.telegram.getFileLink(fileId);
+            const https = require('https');
+            const dest = path.join(config.tempDir, `tg_${Date.now()}_${fileName}`);
+            
+            await new Promise((resolve, reject) => {
+                const file = fs.createWriteStream(dest);
+                https.get(fileLink, function(response) {
+                    response.pipe(file);
+                    file.on('finish', function() {
+                        file.close(resolve);
+                    });
+                }).on('error', function(err) {
+                    fs.unlink(dest, () => {});
+                    reject(err);
+                });
+            });
+            
+            let caption = ctx.message.caption ? ctx.message.caption : "";
+            
+            let explicitTargetId = null;
+            let explicitThreadName = null;
+            let quotedContext = "";
+            if (ctx.message.reply_to_message) {
+                const val = messageTargetMap.get(ctx.message.reply_to_message.message_id);
+                if (typeof val === 'string') explicitTargetId = val;
+                else if (val) { explicitTargetId = val.targetId; explicitThreadName = val.threadName; }
+                
+                quotedContext = extractQuotedContext(ctx);
+            }
+            if (!explicitTargetId && ctx.message.reply_to_message?.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data?.startsWith('focus_')) {
+                explicitTargetId = ctx.message.reply_to_message.reply_markup.inline_keyboard[0][0].callback_data.replace('focus_', '');
+            }
+            
+            if (quotedContext) {
+                caption = caption ? quotedContext + caption : quotedContext.trim();
+            }
+            
+            const mediaGroupId = ctx.message.media_group_id;
+            if (mediaGroupId) {
+                if (!mediaGroupCache.has(mediaGroupId)) {
+                    mediaGroupCache.set(mediaGroupId, {
+                        files: [],
+                        captions: [],
+                        timer: null,
+                        ctx: ctx,
+                        explicitTargetId,
+                        explicitThreadName
+                    });
+                }
+                const group = mediaGroupCache.get(mediaGroupId);
+                group.files.push(dest);
+                if (caption) group.captions.push(caption);
+                
+                clearTimeout(group.timer);
+                group.timer = setTimeout(() => {
+                    mediaGroupCache.delete(mediaGroupId);
+                    processMediaGroup(group);
+                }, 1500);
+                return;
+            }
+            
+            const query = isVoiceOrAudio
+                ? `[System: The user sent a voice message/audio recording. You MUST examine/listen to the audio file at this absolute path using your \`view_file\` tool: ${dest} . Transcribe and understand the user's spoken instruction, and execute the requested task.]${caption ? `\nUser's message: ${caption}` : ''}`
+                : `[System: The user has uploaded an image or file. You MUST use your \`view_file\` tool to examine the file at this absolute path: ${dest} . Do not say you cannot see it. Use the tool!]${caption ? `\nUser's message: ${caption}` : ''}`;
+            
+            await processAgentRequest(ctx, query, explicitTargetId, explicitThreadName, caption || (isVoiceOrAudio ? "🎤 Voice Message" : ""));
+            
+        } catch(err) {
+            const errorMsg = err.message === 'no_chat_input' ? t('ask.no_chat_input') : err.message;
+            ctx.reply(t('photo.error', { error: errorMsg })).catch(() => {});
+        }
+    })();
+});
+
+// ===== LAUNCH =====
+
+async function init() {
+    console.log("Starting initialization...");
+    try {
+        await telegraphPublisher.init();
+        await clearAllMenuScopes();
+        await setMenuOnAllScopes();
+        console.log("Menu commands set.");
+    } catch(e) {
+        console.error("Could not set commands", e.message);
+    }
+    
+    // Auto-accept defaults to false, unless explicitly enabled by env
+    if (process.env.AUTOACCEPT_DEFAULT === 'true') {
+        console.log('[autoaccept] Auto-starting (AUTOACCEPT_DEFAULT=true)...');
+        autoaccept.enable(CDP_PORT).then(r => {
+            console.log(`[autoaccept] Auto-start result: injected=${r.injected}`);
+        }).catch(e => {
+            console.log(`[autoaccept] Auto-start failed: ${e.message} (will retry via heartbeat)`);
+        });
+    } else {
+        console.log('[autoaccept] Disabled by default. Use /autoaccept on to enable.');
+    }
+
+    console.log(t('bot.polling'));
+    
+    // Eagerly resolve the active thread so that watchArtifacts starts listening immediately
+    // rather than waiting for the first user message.
+    try {
+        await getActiveThreadId(CDP_PORT).catch(() => {});
+        console.log('[init] Eagerly resolved thread to attach watchers.');
+    } catch (_) {}
+
+    bot.catch((err, ctx) => {
+        console.error(`[Bot Error] for ${ctx.updateType}:`, err.message || err);
+    });
+
+    // Check if this boot is after an explicit /restart command.
+    // Drop pending updates on startup to prevent backlog replay spam (Issue #31)
+    let shouldDropPending = true;
+    try {
+        if (fs.existsSync(RESTART_FLAG_FILE)) {
+            shouldDropPending = true;
+            fs.unlinkSync(RESTART_FLAG_FILE);
+            console.log('[init] Restart flag detected — dropping pending updates to prevent /restart loop');
+        }
+    } catch (_) {}
+
+    const launchBot = () => {
+        bot.launch({ dropPendingUpdates: shouldDropPending }).catch(err => {
+            console.error("Bot launch failed:", err.message || err);
+            console.log("Retrying in 30 seconds...");
+            setTimeout(launchBot, 30000);
+        });
+    };
+    launchBot();
+
+    // Push the main menu keyboard to the user so it's active by default (wait 3s to let IDE/CDP initialize)
+    setTimeout(() => {
+        const updateFlagPath = path.join(__dirname, '..', '.update_flag');
+        if (fs.existsSync(updateFlagPath)) {
+            const startupMsg = t('update.bot_updated');
+            pushMainMenuToUser(startupMsg).catch(console.error);
+            try { fs.unlinkSync(updateFlagPath); } catch (e) {}
+        } else {
+            // Sadece sessizce menüyü güncelle
+            pushMainMenuToUser(t('bot.restarted'), true).catch(console.error);
+        }
+    }, 3000);
+
+    // Start periodic update checker (notifies via Telegram when update is available)
+    updater.startUpdateChecker(bot, ALLOWED_CHAT_IDS);
+
+    // Initialize Task Watcher — monitors agent's proactive notifications
+    const preferredApp = (process.env.ANTIGRAVITY_PREFERRED_APP || 'ide').toLowerCase();
+    const appDataName = preferredApp === 'agent' ? 'antigravity' : 'antigravity-ide';
+    
+    // Track last proactive notification message per chat for edit-in-place
+    const proactiveMessageIds = new Map(); // chatId -> { messageId, timestamp, hasFeedback }
+    const PROACTIVE_RESET_MS = 5 * 60 * 1000; // Reset after 5 min of silence
+
+    const taskWatcher = new TaskWatcher({
+        appDataName,
+        onNotification: async ({ conversationId, text, type }) => {
+            console.log(`[TaskWatcher] 📬 Notification (${type}, conv: ${conversationId?.substring(0, 8)}, ${text.length} chars)`);
+
+            let header = '';
+            const isCliInput = type === 'cli_user_input';
+            const isCliResponse = type === 'cli_agent_response';
+            const isFeedback = type === 'agent_proactive_feedback';
+
+            if (isCliInput) {
+                header = '👤 <b>CLI User Prompt</b>\n\n';
+            } else if (isCliResponse) {
+                header = '🤖 <b>Antigravity Agent</b>\n\n';
+            } else {
+                header = '🔔 <b>' + t('task_watcher.proactive_msg') + '</b>\n\n';
+            }
+
+            // For CLI user input and CLI agent response, format using markdownToTelegramHtml and send as new message(s)
+            if (isCliInput || isCliResponse) {
+                const cleanText = isCliInput ? (TaskWatcher.cleanUserPrompt ? TaskWatcher.cleanUserPrompt(text) : text) : text;
+                if (!cleanText || !cleanText.trim()) return;
+                const formattedBody = markdownToTelegramHtml(cleanText);
+                const fullMsg = header + formattedBody;
+
+                for (const chatId of ALLOWED_CHAT_IDS) {
+                    try {
+                        if (fullMsg.length <= 4000) {
+                            try {
+                                await bot.telegram.sendMessage(chatId, fullMsg, { parse_mode: 'HTML' });
+                            } catch (parseErr) {
+                                const plain = (isCliInput ? '👤 CLI User Prompt\n\n' : '🤖 Antigravity Agent\n\n') + cleanText;
+                                await bot.telegram.sendMessage(chatId, plain.substring(0, 4000));
+                            }
+                        } else {
+                            const chunks = [];
+                            const lines = fullMsg.split('\n');
+                            let currentChunk = '';
+                            for (let i = 0; i < lines.length; i++) {
+                                let line = lines[i];
+                                if (line.length > 3900) line = line.substring(0, 3900) + '...';
+                                if (currentChunk.length + line.length > 3900) {
+                                    chunks.push(currentChunk);
+                                    currentChunk = '';
+                                }
+                                currentChunk += line + '\n';
+                            }
+                            if (currentChunk.trim().length > 0) chunks.push(currentChunk);
+
+                            for (const chunk of chunks) {
+                                try {
+                                    await bot.telegram.sendMessage(chatId, chunk, { parse_mode: 'HTML' });
+                                } catch (_) {
+                                    const plain = chunk.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+                                    await bot.telegram.sendMessage(chatId, plain.substring(0, 4000));
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.error('[TaskWatcher] Failed to send CLI mirroring notification:', e.message);
+                    }
+                }
+                return;
+            }
+
+            // Truncate for Telegram 4096 char limit
+            const maxLen = 4096 - header.length - 10;
+            const body = text.length > maxLen ? text.substring(0, maxLen) + '…' : text;
+            const fullMsg = header + body;
+
+            for (const chatId of ALLOWED_CHAT_IDS) {
+                try {
+                    const existing = proactiveMessageIds.get(chatId);
+                    const now = Date.now();
+
+                    // If we have a recent message, try to edit it
+                    // BUT: never overwrite a feedback message (with Proceed/Cancel) with a plain notification
+                    if (existing && (now - existing.timestamp) < PROACTIVE_RESET_MS) {
+                        // If existing has feedback buttons and new is plain, skip edit — send new
+                        if (existing.hasFeedback && !isFeedback) {
+                            console.log(`[TaskWatcher] Existing msg ${existing.messageId} has Proceed/Cancel buttons — sending new msg instead of overwriting`);
+                            // Fall through to send new message
+                        } else {
+                            try {
+                                const opts = { parse_mode: 'HTML' };
+                                if (isFeedback) {
+                                    opts.reply_markup = {
+                                        inline_keyboard: [
+                                            [
+                                                { text: t('artifact_feedback.proceed') || '✅ Proceed', callback_data: `fb_proceed_${conversationId.substring(0,8)}` },
+                                                { text: t('artifact_feedback.cancel') || '❌ Cancel', callback_data: `fb_cancel_${conversationId.substring(0,8)}` }
+                                            ]
+                                        ]
+                                    };
+                                }
+                                await bot.telegram.editMessageText(
+                                    chatId, existing.messageId, null,
+                                    fullMsg, opts
+                                );
+                                existing.timestamp = now;
+                                existing.hasFeedback = isFeedback;
+                                console.log(`[TaskWatcher] Edited existing notification msg ${existing.messageId}`);
+                                continue;
+                            } catch (editErr) {
+                                // Edit failed (message too old, deleted, or content unchanged)
+                                console.log(`[TaskWatcher] Edit failed, sending new: ${editErr.message}`);
+                            }
+                        }
+                    }
+
+                    let replyMarkup = undefined;
+                    if (type === 'agent_proactive_feedback') {
+                        replyMarkup = {
+                            inline_keyboard: [
+                                [
+                                    { text: t('artifact_feedback.proceed') || '✅ Proceed', callback_data: `fb_proceed_${conversationId.substring(0,8)}` },
+                                    { text: t('artifact_feedback.cancel') || '❌ Cancel', callback_data: `fb_cancel_${conversationId.substring(0,8)}` }
+                                ]
+                            ]
+                        };
+                    }
+
+                    // Send a new message
+                    try {
+                        const opts = { parse_mode: 'HTML' };
+                        if (replyMarkup) opts.reply_markup = replyMarkup;
+                        const sent = await bot.telegram.sendMessage(chatId, fullMsg, opts);
+                        proactiveMessageIds.set(chatId, { messageId: sent.message_id, timestamp: now, hasFeedback: isFeedback });
+                        console.log(`[TaskWatcher] Sent new notification msg ${sent.message_id}`);
+                    } catch (err) {
+                        if (err.message.includes("parse entities")) {
+                            const plain = fullMsg.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+                            const opts = {};
+                            if (replyMarkup) opts.reply_markup = replyMarkup;
+                            const sent = await bot.telegram.sendMessage(chatId, plain, opts);
+                            proactiveMessageIds.set(chatId, { messageId: sent.message_id, timestamp: now, hasFeedback: isFeedback });
+                            console.log(`[TaskWatcher] Sent plain text fallback ${sent.message_id}`);
+                        } else {
+                            throw err;
+                        }
+                    }
+                } catch (e) {
+                    console.error('[TaskWatcher] Failed to send notification:', e.message);
+                }
+            }
+        }
+    });
+
+    // Wire thread resolution events to TaskWatcher and Artifact Watcher
+    setOnThreadResolved((threadId) => {
+        taskWatcher.setActiveConversation(threadId);
+        watchArtifacts(threadId);
+    });
+
+    // Expose taskWatcher globally so text handler can set busy/idle
+    global.__taskWatcher = taskWatcher;
+
+    const STATE_PATH = path.join(__dirname, '..', '.state.json');
+    let lastSyncedStateMtime = 0;
+    function syncFromState() {
+        try {
+            if (fs.existsSync(STATE_PATH)) {
+                const stat = fs.statSync(STATE_PATH);
+                lastSyncedStateMtime = stat.mtimeMs;
+                const state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+                if (state.syncMode === 'pinned' && state.syncedConversationId) {
+                    if (getLastResolvedThreadId() !== state.syncedConversationId) {
+                        setLastResolvedThreadId(state.syncedConversationId);
+                        taskWatcher.setActiveConversation(state.syncedConversationId);
+                        watchArtifacts(state.syncedConversationId);
+                        console.log(`[state] Synced to pinned conversation: ${state.syncedConversationId.substring(0, 8)}`);
+                    }
+                    return true;
+                } else if (state.syncMode === 'auto') {
+                    const autoId = taskWatcher._findMostRecentConversation();
+                    if (autoId && getLastResolvedThreadId() !== autoId) {
+                        setLastResolvedThreadId(autoId);
+                        taskWatcher.setActiveConversation(autoId);
+                        watchArtifacts(autoId);
+                        console.log(`[state] Synced to auto-discovered conversation: ${autoId.substring(0, 8)}`);
+                    }
+                    return true;
+                }
+            }
+        } catch (e) {
+            console.error('[state] Error reading .state.json:', e.message);
+        }
+        return false;
+    }
+
+    // Start watching conversation on startup
+    if (!syncFromState()) {
+        const initialThreadId = getLastResolvedThreadId() || taskWatcher._findMostRecentConversation();
+        if (initialThreadId) {
+            setLastResolvedThreadId(initialThreadId);
+            taskWatcher.setActiveConversation(initialThreadId);
+            watchArtifacts(initialThreadId);
+            console.log(`[state] Initialized with conversation: ${initialThreadId.substring(0, 8)}`);
+        }
+    }
+
+    // Watch .state.json for dynamic sync changes from tg-ctl sync / connect
+    try {
+        if (fs.existsSync(STATE_PATH)) {
+            fs.watch(STATE_PATH, () => {
+                syncFromState();
+            });
+        }
+    } catch (_) {}
+
+    // Fallback interval to guard against Linux inotify drops
+    setInterval(() => {
+        try {
+            if (fs.existsSync(STATE_PATH)) {
+                const mtime = fs.statSync(STATE_PATH).mtimeMs;
+                if (mtime > lastSyncedStateMtime) {
+                    syncFromState();
+                }
+            }
+        } catch (_) {}
+    }, 1500);
+}
+
+/**
+ * Format quota data into a rich Telegram HTML card.
+ *
+ * Handles two model types returned by the quota API:
+ * - Metered models: have `quotaInfo` with `remainingFraction` → shown as a progress bar.
+ * - Unlimited models: no `quotaInfo` (pro/unlimited tier) → shown as ∞ Unlimited.
+ *
+ * @param {object} account - Saved account record.
+ * @param {object} quotaData - Parsed quota response from fetchQuota().
+ * @returns {string} Telegram HTML.
+ */
+function formatQuotaHtml(account, quotaData) {
+    const L = [];
+
+    // ── Header ──
+    L.push(t('quota.info_title'));
+    L.push('━'.repeat(22));
+    L.push(t('quota.user', { name: account.name || account.email }));
+    L.push(t('quota.email', { email: account.email }));
+    L.push(t('quota.id', { id: account.numericId }));
+
+    const tier = (quotaData.subscription_tier || quotaData._tier || '').replace(/_/g, ' ').trim();
+    if (tier) {
+        L.push(t('quota.tier', { tier }));
+    }
+    if (quotaData.ai_credits) {
+        L.push(t('quota.credits', { credits: quotaData.ai_credits.credits.toLocaleString() }));
+    }
+
+    // ── Detailed Quota Groups ──
+    const groups = quotaData.quota_groups || [];
+    const models = quotaData.models || {};
+    const quotaFilterRaw = (process.env.QUOTA_DISPLAY_MODELS || '').trim();
+    const quotaFilter = quotaFilterRaw
+        ? quotaFilterRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+        : [];
+
+    const matchesFilter = (modelId, info) => {
+        if (quotaFilter.length === 0) {
+            return true;
+        }
+        const displayName = (info.displayName || modelId).toLowerCase();
+        return quotaFilter.some(term => displayName.includes(term));
+    };
+
+    const trackedModels = Object.entries(models)
+        .filter(([name, info]) => /^(gemini|claude|gpt|image|imagen)/i.test(name) && matchesFilter(name, info))
+        .sort(([a], [b]) => {
+            // Recommended first, then alphabetical
+            const aRec = models[a].recommended ? 0 : 1;
+            const bRec = models[b].recommended ? 0 : 1;
+            if (aRec !== bRec) {
+                return aRec - bRec;
+            }
+            return a.localeCompare(b);
+        });
+
+    if (groups.length > 0) {
+        // Helper to format ISO resetTime string to a relative string (e.g., '2d 9h' or '3h 8m')
+        const formatRelativeTime = (isoString) => {
+            if (!isoString) return '';
+            const diffMs = new Date(isoString) - Date.now();
+            if (diffMs <= 0) return 'now';
+
+            const diffSecs = Math.floor(diffMs / 1000);
+            const diffMins = Math.floor(diffSecs / 60);
+            const diffHours = Math.floor(diffMins / 60);
+            const diffDays = Math.floor(diffHours / 24);
+
+            if (diffDays > 0) {
+                const remainingHours = diffHours % 24;
+                return `${diffDays}d ${remainingHours}h`;
+            }
+            if (diffHours > 0) {
+                const remainingMins = diffMins % 60;
+                return `${diffHours}h ${remainingMins}m`;
+            }
+            return `${diffMins}m`;
+        };
+
+        L.push('');
+        L.push(t('quota.detailed_quota_title'));
+        L.push('━'.repeat(22));
+
+        for (const group of groups) {
+            L.push(`<b>${group.display_name}</b>`);
+            if (group.description) {
+                L.push(`<i>${group.description}</i>`);
+            }
+
+            for (const bucket of group.buckets) {
+                const pct = Math.round(bucket.remaining_fraction * 100);
+                const resetStr = formatRelativeTime(bucket.reset_time);
+
+                L.push(`  • <b>${bucket.display_name || bucket.bucket_id}</b>`);
+
+                // 8-segment bar: █ = filled, ░ = empty
+                const filled = Math.round(bucket.remaining_fraction * 8);
+                const bar = '█'.repeat(filled) + '░'.repeat(8 - filled);
+
+                L.push(`    <code>${bar}</code>  <b>${pct}%</b>`);
+                if (resetStr) {
+                    L.push(t('quota.reset_relative', { time: resetStr }));
+                }
+            }
+        }
+    } else if (trackedModels.length > 0) {
+        L.push('');
+        L.push(t('quota.model_quota_title'));
+        L.push('━'.repeat(22));
+
+        for (const [modelId, info] of trackedModels) {
+            const displayName = info.displayName || modelId;
+            const star = info.recommended ? ' ⭐' : '';
+            const isUnlimited = info.unlimited === true || info.quotaInfo === null;
+
+            if (isUnlimited) {
+                // Pro / unlimited tier — no quota cap, show infinity
+                L.push(t('quota.unlimited'));
+                L.push(t('quota.unlimited_model', { model: displayName, star }));
+            } else {
+                // Metered model — show progress bar
+                const remaining = info.quotaInfo?.remainingFraction != null
+                    ? info.quotaInfo.remainingFraction
+                    : (info.percentage != null ? info.percentage / 100 : 0);
+                const pct = Math.round(remaining * 100);
+
+                // 8-segment bar: █ = filled, ░ = empty
+                const filled = Math.round(remaining * 8);
+                const bar = '█'.repeat(filled) + '░'.repeat(8 - filled);
+
+                // Color-coded percentage label
+                const pctLabel = pct >= 50
+                    ? `<b>${pct}%</b>`
+                    : (pct >= 20 ? `${pct}%` : `<i>${pct}%</i>`);
+
+                L.push(`<code>${bar}</code>  ${pctLabel}`);
+                L.push(`  ↳ ${displayName}${star}`);
+
+                const resetTime = info.quotaInfo?.resetTime;
+                if (resetTime) {
+                    const reset = new Date(resetTime);
+                    const resetStr = reset.toLocaleString('en-US', {
+                        month: 'short', day: 'numeric',
+                        hour: '2-digit', minute: '2-digit',
+                        timeZone: 'UTC', timeZoneName: 'short',
+                    });
+                    L.push(t('quota.reset_timestamp', { resetStr }));
+                }
+            }
+        }
+    } else if (quotaData._unlimited) {
+        // Consumer/non-enterprise account — no per-model quota limits
+        L.push('');
+        L.push(t('quota.model_access_title'));
+        L.push('━'.repeat(22));
+        L.push(t('quota.unlimited'));
+        L.push(t('quota.unlimited_desc'));
+    } else {
+        L.push('');
+        L.push(t('quota.no_data'));
+    }
+
+    // ── Token status ──
+    // Access tokens expire every ~60 min, but a refresh_token makes the account
+    // effectively unlimited — ensureFreshToken() auto-refreshes before every operation.
+    const hasRefreshToken = !!(account.token?.refresh_token);
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = account.token?.expiry_timestamp || 0;
+
+    let tokenStatus;
+    if (hasRefreshToken) {
+        // Account is permanently active — access token auto-refreshes
+        tokenStatus = t('quota.token_status_active');
+    } else if (expiresAt === 0) {
+        tokenStatus = t('quota.token_status_unknown');
+    } else {
+        // No refresh token; access token only — show countdown
+        const minsLeft = Math.max(0, Math.round((expiresAt - now) / 60));
+        tokenStatus = minsLeft > 30
+            ? t('quota.token_status_valid', { mins: minsLeft })
+            : (minsLeft > 5
+                ? t('quota.token_status_expiring', { mins: minsLeft })
+                : t('quota.token_status_expired'));
+    }
+
+    L.push('');
+    L.push('━'.repeat(22));
+    L.push(`🔑 ${tokenStatus}`);
+
+    return L.join('\n');
+}
+
+/**
+ * Complete a pending login flow with an authorization code.
+ * Called either by the OAuth server (auto, same-machine) or by manual paste (mobile).
+ */
+async function completePendingLogin(chatId, code) {
+    const session = pendingLogins.get(chatId);
+    if (!session) {
+        return false;
+    }
+    try {
+        await session.oauthServer.stop();
+    } catch { /* ignore */ }
+
+    // Make sure we decode special symbols (like %2F -> /) properly
+    let decodedCode = code;
+    try {
+        decodedCode = decodeURIComponent(code);
+    } catch (_) {}
+
+    // Directly trigger processing of the code asynchronously without blocking the event loop
+    processAuthCode(chatId, decodedCode, session.redirectUri).catch(err => {
+        console.error('[bot] processAuthCode async error:', err);
+    });
+    return true;
+}
+
+/**
+ * Exchange auth code, retrieve user info, save account, fetch quota, and inject credentials.
+ */
+async function processAuthCode(chatId, authCode, redirectUri) {
+    const processingMsg = await bot.telegram.sendMessage(chatId, t('login.authenticating'), { parse_mode: 'HTML' });
+
+    try {
+        // Exchange code for tokens
+        accountManager.logInfo(`[bot] Exchanging code with redirect_uri: ${redirectUri}`);
+        const tokenResp = await accountManager.exchangeCode(authCode, redirectUri);
+        accountManager.logInfo(`[bot] Code exchanged successfully. Access token retrieved.`);
+
+        // Get user info
+        accountManager.logInfo(`[bot] Fetching user info...`);
+        const userInfo = await accountManager.getUserInfo(tokenResp.access_token);
+        if (!userInfo || !userInfo.email) {
+            throw new Error('Failed to retrieve user email from Google. Check your account settings.');
+        }
+        accountManager.logInfo(`[bot] User info retrieved: email=${userInfo.email}`);
+
+        // Save account
+        const accounts = accountManager.loadAccounts();
+        const existing = Object.values(accounts).find(
+            a => a && typeof a === 'object' && a.email && userInfo?.email && a.email.toLowerCase() === userInfo.email.toLowerCase()
+        );
+
+        const now = Math.floor(Date.now() / 1000);
+        const numericId = existing ? existing.numericId : accountManager.getNextNumericId(accounts);
+
+        const account = {
+            numericId,
+            email: userInfo.email,
+            name: userInfo.name || userInfo.email,
+            addedAt: existing ? existing.addedAt : now,
+            updatedAt: now,
+            token: {
+                access_token: tokenResp.access_token,
+                refresh_token: tokenResp.refresh_token || (existing ? existing.token.refresh_token : ''),
+                expires_in: tokenResp.expires_in || 3600,
+                expiry_timestamp: now + (tokenResp.expires_in || 3600),
+                token_type: tokenResp.token_type || 'Bearer',
+            },
+            quota: null,
+        };
+
+        accounts[String(numericId)] = account;
+        accountManager.saveAccounts(accounts);
+        accountManager.logInfo(`[bot] Saved account #${numericId} for ${userInfo.email}`);
+
+        // Try to fetch initial quota (non-fatal if it fails)
+        try {
+            accountManager.logInfo(`[bot] Fetching initial quota for account #${numericId}...`);
+            const quotaData = await accountManager.fetchQuota(tokenResp.access_token);
+            accounts[String(numericId)].quota = quotaData;
+            accountManager.saveAccounts(accounts);
+            accountManager.logInfo(`[bot] Initial quota fetched and saved.`);
+        } catch (e) {
+            accountManager.logInfo(`[bot] Best-effort initial quota fetch failed: ${e.message}`);
+        }
+
+        pendingLogins.delete(chatId);
+
+        const action = existing ? 'updated' : 'added';
+        accountManager.logInfo(`[bot] Sign-in complete for #${numericId}. Editing Telegram message.`);
+        await bot.telegram.editMessageText(chatId, processingMsg.message_id, undefined,
+            [
+                t('login.success_title'),
+                '━'.repeat(22),
+                t('login.success_body', { name: userInfo.name || userInfo.email, email: userInfo.email, numericId, action }),
+            ].join('\n'),
+            { parse_mode: 'HTML' }
+        );
+
+    } catch (e) {
+        pendingLogins.delete(chatId); 
+        console.error('[processAuthCode] Unexpected error:', e.message, e.stack);
+        await bot.telegram.editMessageText(chatId, processingMsg.message_id, undefined,
+            [
+                '❌ <b>' + (t('login.failed').split('\n')[0] || 'Authentication failed') + '</b>',
+                '',
+                `<code>${e.message}</code>`,
+            ].join('\n'), { parse_mode: 'HTML' }).catch(() => {});
+    }
+}
+
+// ── /login ────────────────────────────────────────────────────────────────────
+
+bot.command('login', async (ctx) => {
+    const chatId = ctx.chat.id;
+    accountManager.logInfo(`[bot] /login command received from chatId: ${chatId}. Sending warning.`);
+
+    const warningMsg = [
+        t('login.notice_title'),
+        '━'.repeat(22),
+        t('login.notice_body'),
+        '',
+        t('login.prompt_title'),
+    ].join('\n');
+
+    const keyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback(t('login.btn_continue'), `login_confirm_${chatId}`),
+            Markup.button.callback(t('login.btn_cancel_login'), `login_cancel_${chatId}`)
+        ]
+    ]);
+
+    await ctx.reply(warningMsg, { parse_mode: 'HTML', ...keyboard });
+});
+
+bot.action(/^login_confirm_(\d+)$/, async (ctx) => {
+    const chatId = parseInt(ctx.match[1]);
+    accountManager.logInfo(`[bot] Login confirmed for chatId: ${chatId}. Initiating OAuth callback server...`);
+    
+    await ctx.answerCbQuery(t('login.starting').replace(/<[^>]+>/g, '').trim()).catch(() => {});
+
+    // Cancel any existing pending login for this chat
+    if (pendingLogins.has(chatId)) {
+        accountManager.logInfo(`[bot] Cancelling existing pending login session for chatId: ${chatId}`);
+        const old = pendingLogins.get(chatId);
+        pendingLogins.delete(chatId);
+        try { await old.oauthServer.stop(); } catch { /* ignore */ }
+    }
+
+    let statusMsg;
+    try {
+        statusMsg = await ctx.editMessageText(t('login.starting'), { parse_mode: 'HTML' });
+    } catch {
+        statusMsg = await ctx.reply(t('login.starting'), { parse_mode: 'HTML' });
+    }
+
+    try {
+        // 1. Start OAuth callback server
+        accountManager.logInfo(`[bot] Starting OAuth server...`);
+        let oauthServer;
+        try {
+            oauthServer = await accountManager.startOAuthServer(
+                async (code) => {
+                    accountManager.logInfo(`[bot] OAuth server captured code for chatId: ${chatId}`);
+                    await completePendingLogin(chatId, code);
+                },
+                async (errMsg) => {
+                    accountManager.logInfo(`[bot] OAuth server error callback for chatId: ${chatId}: ${errMsg}`);
+                    const session = pendingLogins.get(chatId);
+                    if (session) {
+                        pendingLogins.delete(chatId);
+                        await bot.telegram.sendMessage(chatId, t('login.server_error', { error: errMsg }), { parse_mode: 'HTML' }).catch(() => {});
+                    }
+                }
+            );
+        } catch (e) {
+            accountManager.logInfo(`[bot] Failed to start OAuth server: ${e.message}`);
+            await ctx.telegram.editMessageText(chatId, statusMsg.message_id, undefined,
+                [
+                    '❌ <b>Login server error</b>',
+                    '',
+                    `<code>${e.message}</code>`,
+                ].join('\n'), { parse_mode: 'HTML' });
+            return;
+        }
+
+        const redirectUri = `http://localhost:${oauthServer.port}/oauth-callback`;
+        const authUrl = accountManager.buildAuthUrl(redirectUri, oauthServer.state);
+        accountManager.logInfo(`[bot] Auth URL built: redirect_uri=${redirectUri}`);
+
+        // Register the pending session (with a 10-minute timeout)
+        pendingLogins.set(chatId, { oauthServer, redirectUri, tryCount: 0 });
+        
+        setTimeout(async () => {
+            if (pendingLogins.has(chatId)) {
+                pendingLogins.delete(chatId);
+                try { await oauthServer.stop(); } catch { /* ignore */ }
+                await bot.telegram.sendMessage(chatId, t('login.timeout'), { parse_mode: 'HTML' }).catch(() => {});
+            }
+        }, 10 * 60 * 1000);
+
+        // Send the login link
+        const loginMsg = [
+            '🔐 <b>Sign in with Google</b>',
+            '━'.repeat(22),
+            'Tap the button below to sign in with your',
+            'Google account and connect it to this bot.',
+            '',
+            '📱 <b>On mobile?</b>',
+            'If your browser shows a connection error after',
+            'signing in, just copy the <b>full URL</b> from',
+            'the address bar and paste it here.',
+            '',
+            '⏱  Expires in <b>10 minutes</b>',
+        ].join('\n');
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.url('🔒 Sign in with Google', authUrl)],
+            [Markup.button.callback('❌ Cancel Login', `login_cancel_${chatId}`)],
+        ]);
+
+        try {
+            await ctx.telegram.editMessageText(chatId, statusMsg.message_id, undefined,
+                loginMsg, { parse_mode: 'HTML', ...keyboard });
+        } catch {
+            await ctx.reply(loginMsg, { parse_mode: 'HTML', ...keyboard });
+        }
+
+    } catch (e) {
+        console.error('[/login] Unexpected error:', e.message, e.stack);
+        ctx.reply([
+            '❌ <b>Something went wrong</b>',
+            '',
+            `<code>${e.message}</code>`,
+        ].join('\n'), { parse_mode: 'HTML' }).catch(() => {});
+    }
+});
+
+// Cancel login inline button
+bot.action(/^login_cancel_(\d+)$/, async (ctx) => {
+    const chatId = parseInt(ctx.match[1]);
+    if (pendingLogins.has(chatId)) {
+        const session = pendingLogins.get(chatId);
+        pendingLogins.delete(chatId);
+        try { await session.oauthServer.stop(); } catch { /* ignore */ }
+    }
+    await ctx.answerCbQuery(t('login.cancelled').split('\n')[0].replace(/<[^>]+>/g, '').trim());
+    await ctx.editMessageText(t('login.cancelled'), { parse_mode: 'HTML' }).catch(() => {});
+});
+
+// ── /logincode ────────────────────────────────────────────────────────────────
+// Explicit code submission for mobile users who cannot reach localhost.
+
+bot.command('logincode', async (ctx) => {
+    const chatId = ctx.chat.id;
+    const rawInput = ctx.message.text.split(' ').slice(1).join(' ').trim();
+
+    if (!rawInput) {
+        return ctx.reply(t('login.code_usage'), { parse_mode: 'HTML' });
+    }
+
+    // Extract code from full URL or bare code
+    let code = rawInput;
+    const match = rawInput.match(/[?&]code=([^&\s]+)/);
+    if (match) {
+        code = match[1];
+    }
+
+    if (!pendingLogins.has(chatId)) {
+        return ctx.reply(t('login.no_active_session'), { parse_mode: 'HTML' });
+    }
+
+    const completed = await completePendingLogin(chatId, code);
+    if (!completed) {
+        return ctx.reply(t('login.no_active_session_short'), { parse_mode: 'HTML' });
+    }
+    await ctx.reply(t('login.code_received'), { parse_mode: 'HTML' });
+});
+
+// ── /accounts ─────────────────────────────────────────────────────────────────
+
+bot.command('accounts', async (ctx) => {
+    await renderAccountsPanel(ctx);
+});
+
+/**
+ * Render the interactive accounts panel with inline buttons.
+ * Used by /accounts command and acc_refresh callback.
+ */
+async function renderAccountsPanel(ctx, editMessageId = null) {
+    const accounts = accountManager.loadAccounts();
+    const entries = Object.entries(accounts)
+        .filter(([k, v]) => !k.startsWith('__') && v && typeof v === 'object' && v.numericId)
+        .map(([, v]) => v)
+        .sort((a, b) => a.numericId - b.numericId);
+
+    if (entries.length === 0) {
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('➕ ' + (t('accounts.btn_add') || 'Add Account'), 'acc_login')],
+        ]);
+        const msg = t('login.no_accounts') || '📭 <b>No accounts saved yet</b>\n\nUse /login to add a Google account.';
+        if (editMessageId) {
+            return ctx.telegram.editMessageText(ctx.chat.id, editMessageId, undefined, msg, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
+        }
+        return ctx.reply(msg, { parse_mode: 'HTML', ...keyboard });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+
+    // Determine which account is currently active
+    const app = process.env.ANTIGRAVITY_PREFERRED_APP || 'ide';
+    let activeId = accounts.__activeId || null;
+    if (!activeId) {
+        try {
+            const ideEmail = await accountManager.getActiveEmail(app);
+            if (ideEmail) {
+                const match = entries.find(e => e.email.toLowerCase() === ideEmail.toLowerCase());
+                if (match) activeId = String(match.numericId);
+            }
+        } catch { /* ignore */ }
+    }
+
+    // Compact header — just title
+    const L = [
+        `🔐 <b>${t('accounts.title') || 'Saved Accounts'}</b>`,
+    ];
+
+    // Build inline buttons: one row per account
+    // Active: 🟢 email (no switch needed)  |  📊  |  🗑
+    // Others: 🔄 email (click to switch)   |  📊  |  🗑
+    const buttons = [];
+    for (const acc of entries) {
+        const isActive = activeId && String(acc.numericId) === String(activeId);
+        const isAccessExpired = (acc.token?.expiry_timestamp || 0) < now;
+        const hasRefreshToken = !!acc.token?.refresh_token;
+
+        // Short email label (truncate if > 25 chars for button fit)
+        const emailLabel = acc.email.length > 25
+            ? acc.email.slice(0, 22) + '…'
+            : acc.email;
+
+
+        let switchLabel;
+        if (isActive) {
+            switchLabel = `🟢 ${acc.email}`;
+        } else if (isAccessExpired && !hasRefreshToken) {
+            switchLabel = `🔴 ${acc.email}`;
+        } else {
+            switchLabel = `🔄 ${acc.email}`;
+        }
+
+        // Row 1: full-width email button
+        buttons.push([
+            Markup.button.callback(switchLabel, isActive ? `acc_info_${acc.numericId}` : `acc_switch_${acc.numericId}`),
+        ]);
+        // Row 2: action icons
+        buttons.push([
+            Markup.button.callback(`📊 ${t('accounts.btn_quota') || 'Quota'}`, `acc_info_${acc.numericId}`),
+            Markup.button.callback(`🗑 ${t('accounts.btn_delete') || 'Delete'}`, `acc_del_${acc.numericId}`),
+        ]);
+    }
+    buttons.push([
+        Markup.button.callback('➕ ' + (t('accounts.btn_add') || 'Add Account'), 'acc_login'),
+    ]);
+
+    const keyboard = Markup.inlineKeyboard(buttons);
+    const text = L.join('\n');
+
+    if (editMessageId) {
+        return ctx.telegram.editMessageText(ctx.chat.id, editMessageId, undefined, text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
+    }
+    await ctx.reply(text, { parse_mode: 'HTML', ...keyboard });
+}
+
+// ── Account Panel Callback Handlers ──────────────────────────────────────────
+
+// Switch account via button
+bot.action(/^acc_switch_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    await ctx.answerCbQuery(`Switching to #${id}...`);
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, id);
+    if (!account) {
+        return ctx.editMessageText(t('switchacc.not_found', { id }), { parse_mode: 'HTML' }).catch(() => {});
+    }
+    
+    const app = process.env.ANTIGRAVITY_PREFERRED_APP || 'ide';
+    const steps = [];
+    const editStatus = async (text) => {
+        try { await ctx.editMessageText(text, { parse_mode: 'HTML' }); } catch { /* ignore */ }
+    };
+
+    try {
+        steps.push(t('switchacc.step_refreshing'));
+        await editStatus(buildSwitchStatus(account, steps));
+
+        const { account: freshAccount, refreshed } = await accountManager.ensureFreshToken(account);
+        if (refreshed) { accounts[id] = freshAccount; accountManager.saveAccounts(accounts); steps[steps.length - 1] = t('switchacc.step_refreshed'); }
+        else { steps[steps.length - 1] = t('switchacc.step_valid'); }
+        await editStatus(buildSwitchStatus(account, steps));
+
+        // Sync global config files for Antigravity
+        accountManager.syncAntigravityGlobalFiles(freshAccount);
+
+        const targetApps = ['agent', 'ide'];
+        const runningStates = {};
+
+        steps.push(t('switchacc.step_stopping', { app: 'all' }) || 'Stopping Antigravity instances...');
+        await editStatus(buildSwitchStatus(account, steps));
+
+        for (const targetApp of targetApps) {
+            const wasRunning = await isIDERunning(targetApp);
+            runningStates[targetApp] = wasRunning;
+            if (wasRunning) {
+                await killIDE(targetApp);
+                await waitForProcessDead(targetApp, 4000);
+            }
+        }
+        steps[steps.length - 1] = t('switchacc.step_stopped', { app: 'all' }) || 'Stopped Antigravity instances';
+        await editStatus(buildSwitchStatus(account, steps));
+
+        steps.push(t('switchacc.step_writing'));
+        await editStatus(buildSwitchStatus(account, steps));
+
+        let writeErrors = [];
+        for (const targetApp of targetApps) {
+            try {
+                await accountManager.injectTokenIntoIde(freshAccount, targetApp);
+            } catch (injErr) {
+                writeErrors.push(`${targetApp}:${injErr.message.slice(0,30)}`);
+            }
+        }
+        
+        try {
+            await accountManager.writeToCredentialStore(freshAccount.token);
+        } catch (credErr) {
+            writeErrors.push(`keyring:${credErr.message.slice(0,30)}`);
+        }
+        
+        if (writeErrors.length > 0) {
+            steps[steps.length - 1] = t('switchacc.step_written', { app: 'all' }) + ` (Errors: ${writeErrors.join(', ')})`;
+        } else {
+            steps[steps.length - 1] = t('switchacc.step_written', { app: 'all' });
+        }
+        await editStatus(buildSwitchStatus(account, steps));
+
+        steps.push(t('switchacc.step_starting', { app: 'apps' }) || 'Restarting apps...');
+        await editStatus(buildSwitchStatus(account, steps));
+
+        for (const targetApp of targetApps) {
+            if (runningStates[targetApp]) {
+                const appPort = getCDPPort(targetApp);
+                const lastWs = getLastWorkspace(targetApp);
+                try {
+                    cleanLockFile(targetApp);
+                    await launchIDE(lastWs, appPort, targetApp);
+                } catch (e) {
+                    console.error(`[acc_switch] Failed to restart ${targetApp}: ${e.message}`);
+                }
+            }
+        }
+        steps[steps.length - 1] = t('switchacc.step_started', { app: 'apps' }) || 'Restarted apps';
+
+        // Mark this account as active for the panel display
+        accounts.__activeId = String(account.numericId);
+        accountManager.saveAccounts(accounts);
+
+        steps.push('━'.repeat(22));
+        steps.push(t('switchacc.step_done', { id: account.numericId }));
+        steps.push(t('switchacc.step_done_email', { email: account.email }));
+        await editStatus(buildSwitchStatus(account, steps));
+    } catch (e) {
+        console.error('[acc_switch] Error:', e.message);
+        steps.push('━'.repeat(22));
+        steps.push(t('switchacc.error', { error: escHtml(e.message) }));
+        await editStatus(buildSwitchStatus(account, steps));
+    }
+});
+
+// View quota via button
+bot.action(/^acc_info_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    await ctx.answerCbQuery(`Loading quota for #${id}...`);
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, id);
+    if (!account) {
+        return ctx.editMessageText(t('quota.not_found', { id }), { parse_mode: 'HTML' }).catch(() => {});
+    }
+
+    await ctx.editMessageText(t('quota.fetching', { id: account.numericId }), { parse_mode: 'HTML' }).catch(() => {});
+
+    try {
+        const { account: fresh, refreshed } = await accountManager.ensureFreshToken(account);
+        if (refreshed) { accounts[id] = fresh; accountManager.saveAccounts(accounts); }
+
+        const quota = await accountManager.fetchQuota(fresh.token.access_token);
+        accounts[id].quota = quota;
+        accountManager.saveAccounts(accounts);
+
+        const text = formatQuotaHtml(account, quota);
+
+        const backBtn = Markup.inlineKeyboard([
+            [Markup.button.callback('◀️ ' + (t('accounts.btn_back') || 'Back to Accounts'), 'acc_refresh')],
+        ]);
+
+        await ctx.editMessageText(text, { parse_mode: 'HTML', ...backBtn }).catch(() => {});
+    } catch (e) {
+        await ctx.editMessageText(`❌ <code>${escHtml(e.message)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+    }
+});
+
+// Delete via button — triggers confirmation
+bot.action(/^acc_del_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    await ctx.answerCbQuery();
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, id);
+    if (!account) {
+        return ctx.editMessageText(t('quota.not_found', { id }), { parse_mode: 'HTML' }).catch(() => {});
+    }
+
+    const confirmKeyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback(`🗑 ${t('accounts.btn_confirm_delete') || 'Yes, delete'} #${account.numericId}`, `delacc_confirm_${account.numericId}`),
+            Markup.button.callback('✖ ' + (t('accounts.btn_cancel') || 'Cancel'), `delacc_cancel_${account.numericId}`),
+        ],
+    ]);
+
+    await ctx.editMessageText(
+        [
+            `⚠️ <b>${t('accounts.delete_confirm_title') || 'Delete Account'} #${account.numericId}?</b>`,
+            '━'.repeat(22),
+            `👤 <b>${account.name || account.email}</b>`,
+            `📧 <code>${account.email}</code>`,
+            '',
+            t('accounts.delete_confirm_body') || 'This removes the saved token from this bot.',
+            '<i>' + (t('accounts.delete_confirm_note') || 'Antigravity itself will not be affected.') + '</i>',
+        ].join('\n'),
+        { parse_mode: 'HTML', ...confirmKeyboard }
+    ).catch(() => {});
+});
+
+// Refresh / back to accounts panel
+bot.action('acc_refresh', async (ctx) => {
+    await ctx.answerCbQuery();
+    await renderAccountsPanel(ctx, ctx.callbackQuery.message.message_id);
+});
+
+// Login new account via panel button
+bot.action('acc_login', async (ctx) => {
+    const chatId = ctx.chat.id;
+    await ctx.answerCbQuery();
+    accountManager.logInfo(`[bot] acc_login button pressed from chatId: ${chatId}. Sending login notice.`);
+
+    const warningMsg = [
+        t('login.notice_title'),
+        '━'.repeat(22),
+        t('login.notice_body'),
+        '',
+        t('login.prompt_title') || 'Do you want to proceed?',
+    ].join('\n');
+
+    const keyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback(t('login.btn_continue') || '👉 Yes, Continue', `login_confirm_${chatId}`),
+            Markup.button.callback(t('login.btn_cancel') || '✖ Cancel', `login_cancel_${chatId}`)
+        ]
+    ]);
+
+    await ctx.reply(warningMsg, { parse_mode: 'HTML', ...keyboard });
+});
+
+// ── /switchacc ────────────────────────────────────────────────────────────────
+
+/**
+ * Build the message text for the /switchacc live progress card.
+ * Keeps the header constant so Telegram can edit it smoothly.
+ */
+function buildSwitchStatus(account, steps) {
+    return [
+        t('switchacc.title', { id: account.numericId }),
+        t('switchacc.email', { email: account.email }),
+        '━'.repeat(22),
+        ...steps,
+    ].join('\n');
+}
+
+/**
+ * Wait for the specified Antigravity app to fully exit.
+ * Polls isIDERunning() at 500ms intervals for up to timeoutMs (default 8s).
+ * Mirrors AntigravityManager's _waitForProcessExit() in handler.ts.
+ *
+ * @param {string} app - 'agent' or 'ide'
+ * @param {number} [timeoutMs=8000]
+ * @returns {Promise<boolean>} true if the process exited, false if timeout
+ */
+async function waitForProcessDead(app, timeoutMs = 8000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const running = await isIDERunning(app);
+        if (!running) {
+            return true;
+        }
+        await new Promise(r => setTimeout(r, 500));
+    }
+    // Timeout — process may still be alive, but we proceed anyway
+    return false;
+}
+
+bot.command('switchacc', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const idArg = parts[1] ? parts[1].replace(/^#/, '').trim() : null;
+
+    if (!idArg || isNaN(Number(idArg))) {
+        return ctx.reply(t('switchacc.usage'), { parse_mode: 'HTML' });
+    }
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, idArg);
+
+    if (!account) {
+        return ctx.reply(t('switchacc.not_found', { id: idArg }), { parse_mode: 'HTML' });
+    }
+
+    // The preferred app to kill and restart; defaults to 'ide' since the user
+    // has ANTIGRAVITY_PREFERRED_APP=ide — but credential injection targets both.
+    const app = process.env.ANTIGRAVITY_PREFERRED_APP || 'ide';
+
+    const statusMsg = await ctx.reply(
+        [
+            t('switchacc.title', { id: account.numericId }),
+            t('switchacc.email', { email: account.email }),
+            '━'.repeat(22),
+        ].join('\n'),
+        { parse_mode: 'HTML' }
+    );
+
+    const steps = [];
+    const editStatus = async (text) => {
+        try {
+            await ctx.telegram.editMessageText(
+                ctx.chat.id, statusMsg.message_id, undefined,
+                text, { parse_mode: 'HTML' }
+            );
+        } catch { /* ignore edit failures */ }
+    };
+
+    try {
+        // Step 1 — Refresh token if needed
+        // Mirrors AntigravityManager's pre-switch token refresh in switchCloudAccount()
+        steps.push(t('switchacc.step_refreshing'));
+        await editStatus(buildSwitchStatus(account, steps));
+
+        const { account: freshAccount, refreshed } = await accountManager.ensureFreshToken(account);
+        if (refreshed) {
+            // Always persist refreshed tokens by the accounts-map key (idArg),
+            // not just by numericId, to avoid stale token on next use.
+            accounts[String(idArg)] = freshAccount;
+            accountManager.saveAccounts(accounts);
+            steps[steps.length - 1] = t('switchacc.step_refreshed');
+        } else {
+            steps[steps.length - 1] = t('switchacc.step_valid');
+        }
+        await editStatus(buildSwitchStatus(account, steps));
+
+        // Sync global config files for Antigravity
+        accountManager.syncAntigravityGlobalFiles(freshAccount);
+
+        const targetApps = ['agent', 'ide'];
+        const runningStates = {};
+
+        steps.push(t('switchacc.step_stopping', { app: 'all' }) || 'Stopping Antigravity instances...');
+        await editStatus(buildSwitchStatus(account, steps));
+
+        for (const targetApp of targetApps) {
+            const wasRunning = await isIDERunning(targetApp);
+            runningStates[targetApp] = wasRunning;
+            if (wasRunning) {
+                await killIDE(targetApp);
+                await waitForProcessDead(targetApp, 4000);
+            }
+        }
+        steps[steps.length - 1] = t('switchacc.step_stopped', { app: 'all' }) || 'Stopped Antigravity instances';
+        await editStatus(buildSwitchStatus(account, steps));
+
+        steps.push(t('switchacc.step_writing'));
+        await editStatus(buildSwitchStatus(account, steps));
+
+        let writeErrors = [];
+        for (const targetApp of targetApps) {
+            try {
+                await accountManager.injectTokenIntoIde(freshAccount, targetApp);
+            } catch (injErr) {
+                writeErrors.push(`${targetApp}:${injErr.message.slice(0,30)}`);
+            }
+        }
+        
+        try {
+            await accountManager.writeToCredentialStore(freshAccount.token);
+        } catch (credErr) {
+            writeErrors.push(`keyring:${credErr.message.slice(0,30)}`);
+        }
+        
+        if (writeErrors.length > 0) {
+            steps[steps.length - 1] = t('switchacc.step_written', { app: 'all' }) + ` (Errors: ${writeErrors.join(', ')})`;
+        } else {
+            steps[steps.length - 1] = t('switchacc.step_written', { app: 'all' });
+        }
+        await editStatus(buildSwitchStatus(account, steps));
+
+        steps.push(t('switchacc.step_starting', { app: 'apps' }) || 'Restarting apps...');
+        await editStatus(buildSwitchStatus(account, steps));
+
+        for (const targetApp of targetApps) {
+            if (runningStates[targetApp]) {
+                const appPort = getCDPPort(targetApp);
+                const lastWs = getLastWorkspace(targetApp);
+                try {
+                    cleanLockFile(targetApp);
+                    await launchIDE(lastWs, appPort, targetApp);
+                } catch (e) {
+                    console.error(`[switchacc] Failed to restart ${targetApp}: ${e.message}`);
+                }
+            }
+        }
+        steps[steps.length - 1] = t('switchacc.step_started', { app: 'apps' }) || 'Restarted apps';
+
+        // Step 5 — Done
+        // Mark this account as active for the panel display
+        accounts.__activeId = String(account.numericId);
+        accountManager.saveAccounts(accounts);
+
+        steps.push('━'.repeat(22));
+        steps.push(t('switchacc.step_done', { id: account.numericId }));
+        steps.push(t('switchacc.step_done_email', { email: account.email }));
+        await editStatus(buildSwitchStatus(account, steps));
+
+    } catch (e) {
+        console.error('[/switchacc] Error:', e.message);
+        steps.push('━'.repeat(22));
+        steps.push(t('switchacc.error', { error: escHtml(e.message) }));
+        await editStatus(buildSwitchStatus(account, steps));
+    }
+});
+
+// ── /getinfo ──────────────────────────────────────────────────────────────────
+
+bot.command('getinfo', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const idArg = parts[1] ? parts[1].replace(/^#/, '').trim() : null;
+
+    const accounts = accountManager.loadAccounts();
+    const allAccounts = Object.values(accounts).filter(a => a && typeof a === 'object').sort((a, b) => a.numericId - b.numericId);
+
+    if (allAccounts.length === 0) {
+        return ctx.reply(t('quota.no_accounts'), { parse_mode: 'HTML' });
+    }
+
+    // Default to account #1 if no ID given
+    let account;
+    if (!idArg) {
+        account = allAccounts[0];
+    } else if (isNaN(Number(idArg))) {
+        return ctx.reply(t('quota.usage'), { parse_mode: 'HTML' });
+    } else {
+        account = accountManager.findAccount(accounts, idArg);
+    }
+
+    if (!account) {
+        return ctx.reply(t('quota.not_found', { id: idArg }), { parse_mode: 'HTML' });
+    }
+
+    setReaction(ctx, REACTION.THINKING);
+    const loadingMsg = await ctx.reply(t('quota.fetching'), { parse_mode: 'HTML' });
+
+    try {
+        // Refresh token if needed
+        const { account: freshAccount, refreshed } = await accountManager.ensureFreshToken(account);
+        if (refreshed) {
+            accounts[String(account.numericId)] = freshAccount;
+            accountManager.saveAccounts(accounts);
+            account = freshAccount;
+        }
+
+        // Fetch fresh quota
+        let quotaData = account.quota || {};
+        try {
+            quotaData = await accountManager.fetchQuota(account.token.access_token);
+            accounts[String(account.numericId)].quota = quotaData;
+            accountManager.saveAccounts(accounts);
+        } catch (e) {
+            console.warn('[/getinfo] Quota fetch failed:', e.message);
+        }
+
+        const html = formatQuotaHtml(account, quotaData);
+
+        await ctx.telegram.editMessageText(
+            ctx.chat.id, loadingMsg.message_id, undefined,
+            html,
+            { parse_mode: 'HTML' }
+        );
+        setReaction(ctx, REACTION.SUCCESS);
+
+    } catch (e) {
+        console.error('[/getinfo] Error:', e.message);
+        setReaction(ctx, null);
+        await ctx.telegram.editMessageText(
+            ctx.chat.id, loadingMsg.message_id, undefined,
+            t('quota.fetch_failed', { error: e.message }),
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    }
+});
+
+// ── /delacc ─────────────────────────────────────────────────────────────────
+
+bot.command('delacc', async (ctx) => {
+    const parts = ctx.message.text.split(' ');
+    const idArg = parts[1] ? parts[1].replace(/^#/, '').trim() : null;
+
+    if (!idArg || isNaN(Number(idArg))) {
+        return ctx.reply(
+            [
+                'ℹ️ <b>Usage</b>',
+                '━'.repeat(22),
+                '<code>/delacc &lt;id&gt;</code>',
+                '',
+                'Example: <code>/delacc 2</code>',
+                'Use /accounts to see your account IDs.',
+            ].join('\n'),
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, idArg);
+
+    if (!account) {
+        return ctx.reply(
+            [
+                `❌ <b>Account #${idArg} not found</b>`,
+                '',
+                'Use /accounts to see your saved accounts.',
+            ].join('\n'),
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    // Ask for confirmation before deleting
+    const confirmKeyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback(`🗑 Yes, delete #${account.numericId}`, `delacc_confirm_${account.numericId}`),
+            Markup.button.callback('✖ Cancel', `delacc_cancel_${account.numericId}`),
+        ],
+    ]);
+
+    await ctx.reply(
+        [
+            `⚠️ <b>Delete Account #${account.numericId}?</b>`,
+            '━'.repeat(22),
+            `👤 <b>${account.name || account.email}</b>`,
+            `📧 <code>${account.email}</code>`,
+            '',
+            'This removes the saved token from this bot.',
+            '<i>Antigravity itself will not be affected.</i>',
+        ].join('\n'),
+        { parse_mode: 'HTML', ...confirmKeyboard }
+    );
+});
+
+// Confirmation: delete
+bot.action(/^delacc_confirm_(\d+)$/, async (ctx) => {
+    const numericId = parseInt(ctx.match[1]);
+    await ctx.answerCbQuery();
+
+    const accounts = accountManager.loadAccounts();
+    const account = accountManager.findAccount(accounts, String(numericId));
+
+    if (!account) {
+        return ctx.editMessageText(
+            [
+                `❌ <b>Account #${numericId} not found</b>`,
+                '',
+                'It may have already been deleted.',
+            ].join('\n'),
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
+    }
+
+    const email = account.email;
+
+    // Check and log out from active IDE/Agent if the email matches
+    let loggedOutApps = [];
+    for (const app of ['ide', 'agent']) {
+        try {
+            const activeEmail = await accountManager.getActiveEmail(app);
+            if (activeEmail && activeEmail.toLowerCase() === email.toLowerCase()) {
+                await accountManager.logoutIde(app);
+                loggedOutApps.push(app.toUpperCase());
+            }
+        } catch (e) {
+            console.error(`[delacc logout] Error checking/logging out of ${app}:`, e.message);
+        }
+    }
+
+    delete accounts[String(numericId)];
+    accountManager.saveAccounts(accounts);
+
+    const remaining = Object.keys(accounts).filter(k => !k.startsWith('__')).length;
+    
+    let logoutNote = '';
+    if (loggedOutApps.length > 0) {
+        logoutNote = `\n🔓 <b>Session Invalidated</b>: Logged out active session in ${loggedOutApps.join(' & ')}.\n`;
+    }
+
+    await ctx.editMessageText(
+        [
+            `🗑 <b>Account #${numericId} deleted</b>`,
+            '━'.repeat(22),
+            `📧 ${email}`,
+            logoutNote,
+            remaining > 0
+                ? `${remaining} account${remaining !== 1 ? 's' : ''} remaining. Use /accounts to view them.`
+                : 'No accounts remain. Use /login to add one.',
+        ].join('\n'),
+        { parse_mode: 'HTML' }
+    ).catch(() => {});
+});
+
+// Confirmation: cancel
+bot.action(/^delacc_cancel_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery('Cancelled');
+    await ctx.editMessageText(
+        [
+            '✖ <b>Deletion cancelled</b>',
+            '',
+            'Account was not deleted.',
+        ].join('\n'),
+    ).catch(() => {});
+});
+
+init();
+
+// --- Start Heartbeat for Watchdog Agent ---
+const HEARTBEAT_FILE = path.join(__dirname, '..', '.heartbeat');
+function startHeartbeat() {
+    const updateHeartbeat = () => {
+        try {
+            fs.writeFileSync(HEARTBEAT_FILE, Date.now().toString(), 'utf8');
+        } catch (e) {
+            console.error('[heartbeat] Failed to write heartbeat:', e.message);
+        }
+    };
+    updateHeartbeat();
+    setInterval(updateHeartbeat, 30000); // update every 30 seconds
+}
+startHeartbeat();
+
+// Enable graceful stop
+const handleExit = async (signal) => {
+    console.log(`\nReceived ${signal}. Stopping bot polling...`);
+    if (global.__taskWatcher) global.__taskWatcher.stop();
+    for (const watcher of artifactWatchers.values()) {
+        try { watcher.close(); } catch (_) {}
+    }
+    artifactWatchers.clear();
+    try {
+        // Fire-and-forget: bot.stop() may never resolve during long-polling,
+        // but calling it triggers the internal cleanup (webhook delete, offset commit).
+        // We wait a fixed delay to let the HTTP request complete.
+        bot.stop(signal);
+        await new Promise(r => setTimeout(r, 1500));
+        console.log('Bot polling stopped cleanly.');
+    } catch (_) {}
+    // NOTE: We intentionally do NOT call cleanupAll() here.
+    // PM2 restarts should not kill running Antigravity apps.
+    // Use /restart command for explicit app cleanup.
+    process.exit(0);
+};
+
+
+process.once('SIGINT', () => handleExit('SIGINT'));
+process.once('SIGTERM', () => handleExit('SIGTERM'));
