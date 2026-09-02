@@ -1,0 +1,19 @@
+{
+  "name": "antigravity-telegram",
+  "interface": {
+    "displayName": "Antigravity Telegram Integration"
+  },
+  "plugins": [
+    {
+      "name": "telegram-integration",
+      "source": {
+        "source": "url",
+        "url": "./plugins/telegram-integration"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Communication & Remote Access"
+    }
+  ]
+}

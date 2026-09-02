@@ -44,9 +44,25 @@
 
 ---
 
-## ⚡ 60-Second Quickstart
+## ⚡ 1-Command Antigravity Plugin Install (No Clone Required!)
 
-### Automated Setup (Recommended)
+Install the plugin directly into your Antigravity environment without cloning:
+
+```bash
+# 1. Link the marketplace
+agy plugin link antigravity-telegram https://github.com/fordeboy444/antigravity-telegram-intergration.git
+
+# 2. Install the plugin
+agy plugin install telegram-integration@antigravity-telegram
+```
+
+---
+
+## 🚀 Standalone Daemon Setup (Full Background Services)
+
+For users running the standalone Telegram bot daemon, background watchdog supervisor, or headless container services:
+
+### Option 2: Automated Setup (Recommended)
 
 Clone the repository and run the interactive setup wizard:
 
@@ -127,7 +143,17 @@ The repository includes a ready-to-use **Antigravity Plugin Bundle** located at 
 
 ### Installing the Plugin
 
-You can install the plugin during `npm run setup` or manually via symlink:
+#### 1-Command Antigravity Marketplace Install (Recommended)
+
+```bash
+# Link marketplace repo and install plugin
+agy plugin link antigravity-telegram https://github.com/fordeboy444/antigravity-telegram-intergration.git
+agy plugin install telegram-integration@antigravity-telegram
+```
+
+#### Manual / Local Symlink Installation
+
+You can also install the plugin during `npm run setup` or manually via symlink:
 
 ```bash
 # Global plugin installation (Available to all workspaces)
